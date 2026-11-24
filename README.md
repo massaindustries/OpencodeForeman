@@ -67,6 +67,12 @@ npm install --save-dev esbuild typescript @types/node
 `gh` must be installed and authenticated; the loop creates its ledger in the
 repository the directory's `origin` remote points at.
 
+Every command the loop runs is POSIX (`git`, `gh`, single-quoted paths), so on
+Windows it needs a real POSIX shell: **Git for Windows** provides `bash.exe`, and
+the plugin auto-detects it. Set `FOREMAN_SHELL` to an explicit `bash.exe` to
+override the detection. A Windows host without one is refused up front with a
+clear message instead of failing deep inside a git command.
+
 ## Configuration
 
 Every project-specific value is configuration, seeded from the environment and

@@ -26,7 +26,7 @@
  *   loops/          archived loops moved here by hand
  */
 import { Plugin } from "@opencode/plugin"
-import { exec } from "node:child_process"
+import { exec, execSync } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import fs from "node:fs"
 import { hostname } from "node:os"
@@ -516,11 +516,63 @@ function stripLargePlanParts(messages, planPath) {
   }
 }
 
+/* -------------------------------- shell --------------------------------- */
+/**
+ * Every command in this plugin is POSIX: single-quoted arguments (`shellQuote`),
+ * `cp`, and the `git`/`gh` CLI. On Windows `child_process.exec` would hand that
+ * string to cmd.exe, which passes the quotes through verbatim, so a quoted
+ * `git worktree add 'foreman/x' ...` dies with `fatal: invalid reference`.
+ * Running through a real POSIX shell fixes it: Git Bash (shipped with Git for
+ * Windows) on Windows, the platform default (`/bin/sh`) everywhere else.
+ * `FOREMAN_SHELL` overrides the choice; a Windows host without one is refused
+ * up front instead of failing deep inside a git command.
+ */
+const NO_POSIX_SHELL =
+  "REFUSED: this plugin runs POSIX commands (`git`, `gh`, single-quoted paths) through a real shell. " +
+  "Install Git for Windows (which provides `bash.exe`), or set FOREMAN_SHELL to a bash.exe, then restart OpenCode."
+
+function bashCandidates() {
+  // `git --exec-path` -> <Git>/mingw64/libexec/git-core, so the Git root (and
+  // its bash.exe) is found even when it is installed somewhere unusual.
+  const fromGit = (() => {
+    try {
+      const result = execSync("git --exec-path", { encoding: "utf8" }).trim()
+      const marker = /[\\/]mingw(32|64)[\\/]/.exec(result)
+      const root = marker ? result.slice(0, marker.index) : result.replace(/[\\/]libexec[\\/]git-core$/, "")
+      return root ? [path.join(root, "bin", "bash.exe"), path.join(root, "usr", "bin", "bash.exe")] : []
+    } catch {
+      return []
+    }
+  })()
+  return [
+    process.env.FOREMAN_SHELL,
+    process.env.ProgramFiles ? path.join(process.env.ProgramFiles, "Git", "bin", "bash.exe") : null,
+    process.env["ProgramFiles(x86)"] ? path.join(process.env["ProgramFiles(x86)"], "Git", "bin", "bash.exe") : null,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Programs", "Git", "bin", "bash.exe") : null,
+    ...fromGit,
+  ]
+}
+
+let posixShellCache
+/** The shell every command runs through; `undefined` keeps the platform default. */
+function posixShell() {
+  if (process.platform !== "win32") return undefined
+  if (posixShellCache !== undefined) return posixShellCache
+  posixShellCache = bashCandidates().find((candidate) => candidate && fileExists(candidate)) ?? null
+  return posixShellCache
+}
+
 function run(command: string, options: any = {}) {
   return new Promise<any>((resolve) => {
     const startedAt = Date.now()
+    const shell = posixShell()
+    if (process.platform === "win32" && !shell) {
+      resolve({ exitCode: 127, stdout: "", stderr: NO_POSIX_SHELL, durationMs: 0, timedOut: false })
+      return
+    }
     exec(command, {
       cwd: options.cwd,
+      shell,
       env: options.env ? { ...process.env, ...options.env } : undefined,
       timeout: options.timeout ?? RUN_TIMEOUT_MS,
       maxBuffer: options.maxBuffer ?? MAX_BUFFER,
@@ -2682,6 +2734,7 @@ export default Plugin.define({
         execute: async (input, context) => {
           const rawPlan = String(input?.planPath ?? "").trim().replace(/^@/, "")
           if (!rawPlan) return ok("REFUSED: planPath is required. Usage: /foreman start <path-to-plan>")
+          if (process.platform === "win32" && !posixShell()) return ok(NO_POSIX_SHELL)
           const planPath = path.isAbsolute(rawPlan) ? rawPlan : path.resolve(root, rawPlan)
           if (!fileExists(planPath)) return ok(`REFUSED: plan file not found: ${planPath}`)
           const loopId = loopIdFromPlan(planPath)
