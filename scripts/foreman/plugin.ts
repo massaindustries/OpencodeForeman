@@ -525,7 +525,8 @@ function stripLargePlanParts(messages, planPath) {
  * Running through a real POSIX shell fixes it: Git Bash (shipped with Git for
  * Windows) on Windows, the platform default (`/bin/sh`) everywhere else.
  * `FOREMAN_SHELL` overrides the choice; a Windows host without one is refused
- * up front instead of failing deep inside a git command.
+ * up front instead of failing deep inside a git command. Every command also runs
+ * with `windowsHide`, so a console window does not flash up per `git`/`gh` call.
  */
 const NO_POSIX_SHELL =
   "REFUSED: this plugin runs POSIX commands (`git`, `gh`, single-quoted paths) through a real shell. " +
@@ -536,7 +537,7 @@ function bashCandidates() {
   // its bash.exe) is found even when it is installed somewhere unusual.
   const fromGit = (() => {
     try {
-      const result = execSync("git --exec-path", { encoding: "utf8" }).trim()
+      const result = execSync("git --exec-path", { encoding: "utf8", windowsHide: true }).trim()
       const marker = /[\\/]mingw(32|64)[\\/]/.exec(result)
       const root = marker ? result.slice(0, marker.index) : result.replace(/[\\/]libexec[\\/]git-core$/, "")
       return root ? [path.join(root, "bin", "bash.exe"), path.join(root, "usr", "bin", "bash.exe")] : []
@@ -577,6 +578,9 @@ function run(command: string, options: any = {}) {
       timeout: options.timeout ?? RUN_TIMEOUT_MS,
       maxBuffer: options.maxBuffer ?? MAX_BUFFER,
       encoding: "utf8",
+      // A console window would flash up for every command the loop runs on
+      // Windows; keep the child windowless. Ignored on POSIX.
+      windowsHide: true,
     }, (error, stdout, stderr) => {
       const timedOut = Boolean(error?.killed) || error?.signal === "SIGTERM"
       resolve({
