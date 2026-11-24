@@ -161,7 +161,7 @@ async function waitFor(predicate, label, timeoutMs = 15_000) {
 
 // A pid that is guaranteed dead: a child that already exited.
 const deadPid = () => new Promise((resolve, reject) => {
-  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" })
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore", windowsHide: true })
   child.on("error", reject)
   child.on("close", () => {
     const pid = child.pid
@@ -263,7 +263,7 @@ fs.writeFileSync(childScript, [
 // decides whether to await it now or after doing something else.
 function runTool(repo, name, input = {}) {
   const child = spawn(process.execPath, [childScript, bundlePath, repo.dir, name, JSON.stringify(input)], {
-    cwd: repo.dir, env: process.env, stdio: ["ignore", "pipe", "pipe"],
+    cwd: repo.dir, env: process.env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
   })
   let stdout = ""
   let stderr = ""
