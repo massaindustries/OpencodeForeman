@@ -11,6 +11,21 @@ Everything project-specific is configuration, not code. Out of the box it assume
 nothing about your repository: no barrels, no auth lane, no publish branch beyond
 `main`.
 
+## Demo
+
+![OpencodeForeman demo](docs/demo.gif)
+
+A real, unstaged recording of the OpenCode **TUI** driving the loop on a throwaway
+plan (`plans/Demo.md`): `/foreman start` opens the plan as GitHub issues, dispatches
+a worker into its own git worktree, verifies step 1 against its acceptance commands,
+and closes it as `foreman:verified`. Nothing is scripted — the issues are real, and
+the terminal was captured headlessly, with no window opened.
+
+[Full 80-second cut (TUI → GitHub, MP4)](docs/demo.mp4) · recording pipeline in
+[`docs/DEMO.md`](docs/DEMO.md). The separate end-to-end drill stays in the repo:
+`npm run foreman:drill` exercises the whole loop against a throwaway repository — no
+network, no real `gh` — and asserts every guardrail.
+
 ## What it does
 
 - **Plans as graphs.** A plan becomes units with scopes, dependencies, seams and a
