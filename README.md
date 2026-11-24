@@ -1,3 +1,5 @@
+![OpencodeForeman](docs/foreman.png)
+
 # OpencodeForeman
 
 A **config-driven, always-awake foreman loop** for [OpenCode](https://opencode.ai).
