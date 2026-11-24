@@ -1,0 +1,11 @@
+# Dependencies
+node_modules/
+
+# Foreman runtime state (loops, worktrees, ledger cache)
+.foreman/
+
+# Logs and editor noise
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db

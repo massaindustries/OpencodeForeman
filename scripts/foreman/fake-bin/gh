@@ -1,0 +1,57 @@
+#!/bin/sh
+# fake gh for scripts/foreman/drill.mjs.
+#
+# Every invocation is appended to $GH_LOG (one "SHIM ..." line per call), so
+# the drill can prove which commands the plugin ran and that no real gh was
+# reached. `issue create` returns a fake issue number/URL; every other
+# subcommand succeeds silently. Nothing here opens a socket.
+#
+#   GH_LOG       absolute path of the capture file (required)
+#   GH_COUNTER   optional path of the issue-number counter (defaults to
+#                $GH_LOG.counter), so numbers are stable across processes
+#   GH_SLEEP_MS  optional: delay every `issue create` by that many milliseconds.
+#                scripts/foreman/concurrency-probe.mjs uses it to hold the loop
+#                lock for a provably long critical section. Unset means no delay.
+set -u
+
+log=${GH_LOG:-}
+if [ -z "$log" ]; then
+  echo "fake gh: GH_LOG must point at a capture file" >&2
+  exit 97
+fi
+counter=${GH_COUNTER:-$log.counter}
+
+# Never let a substitute reach the network: this file has no exec at all.
+printf 'SHIM cwd=%s args=%s\n' "$(pwd)" "$*" >> "$log" || exit 98
+
+case "$1 ${2:-}" in
+  "repo view")
+    printf '%s\n' "fake/drill"
+    ;;
+  "label create")
+    ;;
+  # The human channel: `issue list --label human` prints the JSON in
+  # GH_HUMAN_JSON (default: no issues), and `issue view --json updatedAt`
+  # prints GH_HUMAN_UPDATED, so a test can drive both the pending poll and the
+  # stamp refresh after our own acknowledgement comment.
+  "issue list")
+    printf '%s\n' "${GH_HUMAN_JSON:-[]}"
+    ;;
+  "issue view")
+    printf '%s\n' "${GH_HUMAN_UPDATED:-}"
+    ;;
+  "issue create")
+    if [ -n "${GH_SLEEP_MS:-}" ]; then
+      sleep "$(( GH_SLEEP_MS / 1000 )).$(printf '%03d' $(( GH_SLEEP_MS % 1000 )))"
+    fi
+    n=0
+    if [ -f "$counter" ]; then n=$(cat "$counter"); fi
+    n=$((n + 1))
+    printf '%s' "$n" > "$counter"
+    printf 'https://github.com/fake/drill/issues/%s\n' "$n"
+    ;;
+  *)
+    ;;
+esac
+
+exit 0
