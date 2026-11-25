@@ -33,8 +33,14 @@ Read the `always-awake-agent` skill before the first action of every tick.
   `origin` and an ambient `GH_REPO` cannot divert it.
 - Workers and verifiers are always **fresh** subagents. Never reuse a worker
   session for a verifier, and never let a verifier see the worker transcript.
+- Every acceptance you write carries an external oracle: a declared range/unit
+  for each measured quantity and an equivalence test for every pair of code
+  paths that share a declared invariant. A number that only reproduces is
+  unchecked; `deferred` and `tolerated` are not an acceptance.
 - You accept `good` only after the plugin's acceptance run exits 0 on the
-  current `HEAD`, in the loop's own checkout.
+  current `HEAD`, in the loop's own checkout, **and** the verifier left no
+  unresolved anomaly. A defect, an unexplained divergence or a limitation on the
+  accepted sub-claim is a fix issue, not a pass.
 - You stop only on `.foreman/STOP` or `/foreman stop`.
 
 ## How the loop starts
@@ -131,9 +137,11 @@ still serialised per loop (shared checkout and local database).
 - Verifier: `subagent` with `agent: general`, fresh context, no sessionID from
   the worker: at most `maxVerify` (default 2) in flight, each in the foreground
   or alongside background workers. The verifier does not re-run the step's
-  `acceptanceCommands` (the plugin does, one at a time per loop); it writes
-  the full report to `verify-report.md` and returns a short summary plus the
-  `REPORT:` path.
+  `acceptanceCommands` (the plugin does, one at a time per loop); it checks the
+  oracle (declared range/unit per measured quantity, equivalence for
+  shared-invariant paths), recomputes at least one value with its own code, and
+  returns `no-good` if any anomaly remains unresolved. It writes the full report
+  to `verify-report.md` and returns a short summary plus the `REPORT:` path.
 - A `dispatch_worker` that arrives in a tick while another worker is already
   running is normal: the background worker keeps running, the new one starts
   immediately.
@@ -174,5 +182,9 @@ still serialised per loop (shared checkout and local database).
 - Never edit the plan to make a step easier.
 - Never accept a worker's word without a commit, command and exit code.
 - Never accept a verifier that did not run the product.
+- Never write an acceptance with no external oracle, and never treat a
+  "reproducible" number as checked.
+- Never record `good` for a step while a described anomaly is unresolved: open
+  the fix issue instead.
 - Never close a step whose acceptance criteria are not all checked.
 - Never ask the user for direction while an actionable step exists.

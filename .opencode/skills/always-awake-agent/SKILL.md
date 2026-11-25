@@ -81,6 +81,19 @@ own test plan, so it cannot be steered by the implementation.
    moving. One git worktree per step, reused by its fix attempts; the plugin
    cherry-picks each commit onto the loop branch one at a time and retires the
    worktree when the step is verified.
+8. **Verifies with an oracle, not with itself.** Every step that produces a
+   measured quantity or a behaviour carries at least one **external oracle**: a
+   check whose expected value comes from the metric's definition or an
+   independent reconstruction, never from the artifact's own output. A number
+   that only "reproduces" is not checked. Every pair of code paths declared to
+   share an invariant (engine vs port, read vs write, fitter vs grid, cached vs
+   recomputed) carries an equivalence test on shared inputs. See *Acceptance
+   oracles* below.
+9. **No `good` carries an open anomaly.** A defect, an unexplained divergence or
+   a limitation on the accepted sub-claim that the verifier describes — in NOTES,
+   in the report or in the transcript — is a finding, not a pass: the verdict is
+   `no-good` (a fix issue) or the anomaly is filed as its own issue before the
+   step is accepted. `deferred` and `tolerated` are not verdicts.
 
 ## Tick contract
 
@@ -97,7 +110,10 @@ question unless the loop is blocked.
    verbatim, then pass the same line range to `foreman_step` as `planRef`.
 3. Execute every returned action:
    - `create_step` → `foreman_step` with `unitId` when a graph exists, plus
-     title, goal, acceptance, `acceptanceCommands` and scope. A tick can offer
+     title, goal, acceptance, `acceptanceCommands` and scope. Every acceptance
+     carries an external oracle (see *Acceptance oracles*): a declared range/unit
+     for each measured quantity and an equivalence test for each pair of
+     shared-invariant paths. A tick can offer
      several (up to the free worker budget): call `foreman_step` once per
      action.
    - `dispatch_worker` → `subagent` (agent `general`) with the worker brief
@@ -198,6 +214,13 @@ the loop branch tip with node_modules in place). Do not create a worktree and do
 not reinstall.
 Exercise the real product (API, UI, CLI). Partial testing is not accepted: cover
 the acceptance criteria and at least one failure mode.
+Check the oracle, not only the artifact: for every measured quantity in the
+acceptance confirm the value is inside the declared range/unit, and for every
+pair of paths declared to share an invariant run the equivalence check.
+Recompute at least one value with your own code from the inputs; re-running the
+artifact's own script is not independent. If anything you would write in NOTES
+is a defect, an unexplained divergence or a limitation on the accepted
+sub-claim, the verdict is `no-good`: `good` must not carry an unresolved anomaly.
 Start any scratch server on a free port and stop it before you report; never
 leave a listener behind and never restart the shared stack.
 Write the full report to `verify-report.md` in that worktree; return a short
@@ -262,6 +285,31 @@ A delivered but unacknowledged message holds `foreman_step` and `foreman_graph`,
 so the tick always reads first. STOP wins over the channel, and a message without
 `loop:<Name>` is ignored (stated by `foreman_status`).
 
+## Acceptance oracles
+
+A green command that only shows the artifact is internally consistent is not
+evidence. Every step that produces a measured quantity or a behaviour must carry
+at least one **external oracle**, and the foreman writes it into the step's
+acceptance before dispatch, never after a failure.
+
+- **Measured quantities.** Every metric in the acceptance states its expected
+  range and unit, taken from the metric's definition (or an independent
+  reconstruction), not from the artifact's own output. A value that is only
+  "reproducible" is unchecked; the acceptance fails when the value falls outside
+  the declared range/unit or the unit changes between runs (for example a
+  perplexity is `O(10)` and never `O(1000)`, an accuracy is `0..1` or `0..100 %`
+  but never both by accident).
+- **Cross-path parity.** When two code paths are declared to share an invariant
+  (engine vs port, read vs write, fitter vs grid, cached vs recomputed), the
+  acceptance includes an equivalence test on shared inputs. "Deferred" and
+  "tolerated" are not an acceptance: the parity is either tested or declared as
+  *not claimed*.
+- **Independent recomputation.** The verifier recomputes at least one value with
+  its own code from the inputs, instead of re-running the artifact's script; a
+  re-run of the same script shares its failure modes and cannot falsify it.
+
+A step whose acceptance has no oracle is an incomplete step.
+
 ## Evidence contract
 
 Accepted only when all of these are present:
@@ -275,7 +323,8 @@ Accepted only when all of these are present:
 
 Rejected: "it works", screenshots without a command, a passing test that was
 weakened, a mock-only proof, an uncommitted change, a verdict recorded while
-`HEAD` moved.
+`HEAD` moved, a `good` that carries a described anomaly, an acceptance with no
+external oracle.
 
 ## Planner brief (graph plans)
 
@@ -306,6 +355,10 @@ Read the plan, then call `foreman_graph` once with the units in plan order:
   empty by default, so a project with no shared barrel has no barrel rule. The
   planner writes the end-to-end fan-in acceptance (a spec that crosses both
   sides) first.
+- Every fan-in acceptance carries an external oracle (a declared range/unit for
+  each measured quantity and, where the fan-in joins two sides that share an
+  invariant, the equivalence test): the fan-in is where the two paths meet, so
+  it is the natural parity check.
 
 `foreman_step` requires `unitId` once a graph exists, and a unit has exactly one
 step. The graph cannot change after a step has taken a unit.
