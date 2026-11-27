@@ -172,6 +172,38 @@ workers run. The total pipeline is capped at `maxParallel + maxVerify`. Every
 dispatch is a `dispatch` ledger record, and `foreman_status` reports the peak
 concurrent workers with the minutes spent at two or more.
 
+## Verification: blockers, follow-ups, receipts
+
+`acceptance` is the blocking contract. A verifier that returns `no-good` must
+pass `blockingFindings`: a 1-based acceptance index or a failing command, with
+the evidence. A no-good without one is refused; the finding belongs in
+`followUps`, which the plugin files as `foreman:followup` issues and never lets
+gate the step or the plan.
+
+`acceptanceChecks` give each command the paths it reads:
+
+```json
+{
+  "command": "python sft/scripts/dump_labels.py --check-reference",
+  "inputs": ["sft/scripts", "sft/tests", "sft/lara_data", "/data/shards"],
+  "serialGroup": "data"
+}
+```
+
+The plugin fingerprints those inputs (content hash for small files, size+mtime
+for large artifacts), and a passing receipt with the same fingerprint is
+recorded as `reused` instead of re-run. A report-only commit therefore does not
+re-run the data pipeline; a code or data change invalidates the receipt. A
+repeated failure signature escalates: the fix issue must add a committed
+falsification test, and the next verifier tests that suite. `failureClass:
+"environment"` opens a `foreman:setup` issue and blocks the loop without
+consuming a fix attempt.
+
+`artifactDependsOn` is the weaker dependency edge: the unit waits until the
+upstream worker's step is `implemented` (the files exist), not until it is
+verified. Use it so GPU/data work starts while a documentary tail is still in
+verification.
+
 ## Attempts and rework
 
 One worktree per **step**, not per issue, and the plugin owns it: `foreman_worktree`

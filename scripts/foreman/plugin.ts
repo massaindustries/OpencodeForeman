@@ -972,9 +972,46 @@ function annotateDependencyEntry(entry, externalNumbers, externalEntry) {
     external.has(Number(digits)) ? `#${digits} (external dependency: not a step of this loop)` : match)
 }
 
-function stepBody({ n, title, goal, acceptance, acceptanceCommands, scope, dependsOn, externalDependencies, externalDependencyNumbers, state, unit, planRef }) {
+const stringList = (value) => (Array.isArray(value) ? value : [])
+  .map((item) => String(item ?? "").trim())
+  .filter(Boolean)
+
+function followUpIssueBody({ step, text, loopName }) {
+  return `# Follow-up — step ${step.n}
+
+Part of #${step.planIssue}
+Loop: \`${loopName}\`
+
+${text}
+
+This issue is **non-blocking**: it never gates the step, the unit or the plan.
+Close it when the item is done. Do not reopen the step for it.
+`
+}
+
+async function fileFollowUps(root, store, state, step, texts) {
+  const loopName = loopNameOf(state)
+  const created = []
+  for (const text of stringList(texts)) {
+    const issue = await createIssue(root, store, {
+      title: `[${loopName}] Follow-up — step ${step.n}: ${text.replace(/\s+/g, " ").slice(0, 88)}`,
+      body: followUpIssueBody({ step, text, loopName }),
+      labels: ["foreman:followup", `step:${step.n}`, `loop:${loopName}`],
+    }, repoOf(state))
+    if (issue.ok) created.push(Number(issue.number))
+  }
+  return created
+}
+
+function stepBody({ n, title, goal, acceptance, acceptanceCommands, acceptanceChecks, followUps, scope, dependsOn, externalDependencies, externalDependencyNumbers, state, unit, planRef }) {
   const criteria = acceptance.length ? acceptance.map((item) => `- [ ] ${item}`).join("\n") : "- [ ] (none declared)"
   const commands = acceptanceCommands.length ? `\`\`\`\n${acceptanceCommands.join("\n")}\n\`\`\`` : "(none declared)"
+  const checks = Array.isArray(acceptanceChecks) && acceptanceChecks.length
+    ? acceptanceChecks.map((check) => `- \`${check.command}\`${Array.isArray(check.inputs) && check.inputs.length ? ` (inputs: ${check.inputs.map((item) => `\`${item}\``).join(", ")})` : " (inputs: whole checkout)"}`).join("\n")
+    : "- (no per-check inputs declared: each command is fingerprinted over the whole checkout)"
+  const followUpBlock = followUps.length
+    ? `\n## Follow-ups (non-blocking)\n\nThese are filed as separate issues. They never gate this step's verdict.\n\n${followUps.map((item) => `- [ ] ${item}`).join("\n")}\n`
+    : ""
   const files = scope.length ? scope.map((item) => `- \`${item}\``).join("\n") : "- (not declared: keep the change minimal)"
   const external = Array.isArray(externalDependencies) ? externalDependencies : []
   const deps = dependsOn.length
@@ -988,6 +1025,7 @@ function stepBody({ n, title, goal, acceptance, acceptanceCommands, scope, depen
 - id: \`${unit.id}\`
 - class: \`${unit.class}\`
 - depends on units: ${unit.dependsOn.length ? unit.dependsOn.map((item) => `\`${item}\``).join(", ") : "none"}
+- artifact dependencies: ${Array.isArray(unit.artifactDependsOn) && unit.artifactDependsOn.length ? unit.artifactDependsOn.map((item) => `\`${item}\``).join(", ") : "none"}
 - seam: ${unit.seam.length ? unit.seam.map((item) => `\`${item}\``).join(", ") : "none"}
 ${unit.class === "integration" ? "- fan-in: this step closes the batch. It is the only step allowed to touch a barrel; resolve the contract conflicts and prove the end-to-end flow. Its acceptance was written before the parallel workers started.\n" : ""}
 `
@@ -1005,13 +1043,17 @@ ${unit.class === "integration" ? "- fan-in: this step closes the batch. It is th
 
 ${goal}
 
-## Acceptance
+## Acceptance (blocking)
 
 ${criteria}
 
 ## Exact commands (executed by the plugin)
 
 ${commands}
+
+## Command inputs (receipt reuse)
+
+${checks}
 
 ## Scope (files)
 
@@ -1020,7 +1062,7 @@ ${files}
 ${unitBlock}## Dependencies
 
 ${deps}
-
+${followUpBlock}
 ## Evidence required
 
 - commit sha on the dedicated branch
@@ -1053,10 +1095,16 @@ ${result.outputTail || "(not provided)"}
 `
 }
 
-function fixBody({ step, verify, failing }) {
+function fixBody({ step, verify, failing, repeat = 0, blockingFindings = [] }) {
   const previous = step?.result ?? {}
   const worktree = String(step?.worktree ?? previous.worktree ?? "").trim()
   const commit = String(previous.commit ?? "").trim()
+  const findings = Array.isArray(blockingFindings) && blockingFindings.length
+    ? `## Blocking findings\n\n${blockingFindings.map((item) => `- ${item.acceptance ? `acceptance #${item.acceptance}` : `command \`${item.command}\``}: ${item.evidence || "(no evidence text)"}`).join("\n")}\n`
+    : ""
+  const repeatBlock = repeat > 0
+    ? `## Repeat failure (${repeat + 1}th time)\n\nThis is the same failure signature as an earlier attempt. Fixing only the report text is not enough: add a **committed falsification test** that fails on the current tree and passes after the fix, and add it to the step's acceptance commands. The next verifier will run that test, not a fresh prose audit.\n`
+    : ""
   const where = worktree || commit
     ? [
       "## Where the work is",
@@ -1086,11 +1134,11 @@ ${failing.outputTail || "(not provided)"}
 
 ${verify.notes || "(none)"}
 
-${where}## Acceptance (unchanged)
+${findings}${repeatBlock}${where}## Acceptance (unchanged)
 
 ${(step.acceptance ?? []).map((item) => `- [ ] ${item}`).join("\n") || "- (none declared)"}
 
-Fix the failure without weakening the acceptance criteria. Change only what the failure needs.
+${(step.followUps ?? []).length ? `## Follow-ups (non-blocking)\n\n${(step.followUps ?? []).map((item) => `- [ ] ${item}`).join("\n")}\n\nDo not spend this fix on these; they are separate issues.\n\n` : ""}Fix the failure without weakening the acceptance criteria. Change only what the failure needs.
 `
 }
 
@@ -1299,20 +1347,99 @@ async function authPreflightIfNeeded(root, store): Promise<any> {
   return { lane, checked: true, ...check }
 }
 
-async function runAcceptance(cwd, commands, timeout) {
+// --------------------------------- acceptance --------------------------------
+// Acceptance is a function of the inputs, not of the attempt number. A check
+// declares the paths it reads; its fingerprint is cheap (content hash for small
+// files, size+mtime for big artifacts) and a passing receipt with the same
+// fingerprint is reused instead of re-running a multi-minute command for a
+// one-line report edit.
+const FINGERPRINT_INLINE_MAX = 1024 * 1024
+const FINGERPRINT_SKIP = new Set([".git", "node_modules", ".foreman", "__pycache__", ".pytest_cache"])
+
+function fingerprintInputs(cwd, inputs) {
+  const parts = []
+  const walk = (target, label) => {
+    let info
+    try { info = fs.statSync(target) } catch { parts.push(`${label}:missing`); return }
+    if (info.isDirectory()) {
+      let entries = []
+      try { entries = fs.readdirSync(target).sort() } catch { parts.push(`${label}:unreadable`); return }
+      for (const entry of entries) {
+        if (FINGERPRINT_SKIP.has(entry)) continue
+        walk(path.join(target, entry), `${label}/${entry}`)
+      }
+      return
+    }
+    if (!info.isFile()) return
+    if (info.size <= FINGERPRINT_INLINE_MAX) {
+      const digest = createHash("sha256").update(fs.readFileSync(target)).digest("hex")
+      parts.push(`${label}:${info.size}:${digest}`)
+    } else {
+      // A 14.5GB checkpoint is not re-hashed on every tick; the size and mtime
+      // are enough to invalidate the receipt when the file is replaced.
+      parts.push(`${label}:${info.size}:${Math.floor(info.mtimeMs)}`)
+    }
+  }
+  const list = Array.isArray(inputs) && inputs.length ? inputs : ["."]
+  for (const input of list) {
+    const raw = String(input ?? "").trim()
+    if (!raw) continue
+    walk(path.isAbsolute(raw) ? raw : path.resolve(cwd, raw), raw)
+  }
+  return sha256(parts.join("\n"))
+}
+
+function normaliseChecks(value, fallbackCommands = []) {
+  const source = Array.isArray(value) ? value : []
+  const checks = source
+    .filter(isObject)
+    .map((item) => ({
+      command: String(item.command ?? "").trim(),
+      inputs: stringList(item.inputs),
+      ...(String(item.serialGroup ?? "").trim() ? { serialGroup: String(item.serialGroup).trim() } : {}),
+    }))
+    .filter((item) => item.command)
+  if (checks.length) return checks
+  return (Array.isArray(fallbackCommands) ? fallbackCommands : [])
+    .map((command) => String(command ?? "").trim())
+    .filter(Boolean)
+    .map((command) => ({ command, inputs: ["."] }))
+}
+
+async function runAcceptanceChecks(cwd, checks, timeout, receipts, commit) {
   const runs = []
-  // Sequential on purpose: acceptance commands can touch the local database and
-  // must never overlap with each other.
-  for (const command of commands) {
-    const result = await run(command, { cwd, timeout })
+  const next = { ...(isObject(receipts) ? receipts : {}) }
+  for (const check of checks) {
+    const inputsHash = fingerprintInputs(cwd, check.inputs)
+    const key = sha256(`${check.command}\u0000${inputsHash}`)
+    const prior = next[key]
+    if (prior && prior.exitCode === 0 && prior.inputsHash === inputsHash) {
+      runs.push({
+        command: check.command,
+        exitCode: 0,
+        durationMs: 0,
+        outputTail: `reused passing receipt from ${prior.at} (${String(prior.commit ?? "").slice(0, 8) || "unknown commit"}): inputs unchanged (${check.inputs.join(", ") || "whole checkout"})`,
+        reused: true,
+        inputs: check.inputs,
+        inputsHash,
+      })
+      continue
+    }
+    const result = await run(check.command, { cwd, timeout })
     runs.push({
-      command,
+      command: check.command,
       exitCode: result.exitCode,
       durationMs: result.durationMs,
       outputTail: tail(`${result.stdout}${result.stderr}`),
+      reused: false,
+      inputs: check.inputs,
+      inputsHash,
     })
+    if (result.exitCode === 0) {
+      next[key] = { command: check.command, inputs: check.inputs, inputsHash, exitCode: 0, at: nowIso(), commit }
+    }
   }
-  return runs
+  return { runs, receipts: next }
 }
 
 async function commitExists(cwd, sha) {
@@ -1883,6 +2010,7 @@ const graphOf = (state): any[] => (Array.isArray(state?.units) ? state.units : [
     title: String(unit.title ?? unit.id),
     class: UNIT_CLASSES.includes(unit.class) ? unit.class : "independent",
     dependsOn: Array.isArray(unit.dependsOn) ? unit.dependsOn.map((dep) => String(dep ?? "").trim()).filter(Boolean) : [],
+    artifactDependsOn: Array.isArray(unit.artifactDependsOn) ? unit.artifactDependsOn.map((dep) => String(dep ?? "").trim()).filter(Boolean) : [],
     scope: normaliseScope(unit.scope),
     seam: normaliseScope(unit.seam),
   }))
@@ -1949,7 +2077,18 @@ const unitDependencyRefs = (state, unit) => {
 function unitStepBarriers(state, unit) {
   const steps = Array.isArray(state?.steps) ? state.steps : []
   const pending = unit.dependsOn.filter((dep) => !unitVerified(state, dep))
-  const waits = pending.length ? [`waits for ${pending.join(", ")}`] : []
+  // Artifact dependencies are weaker than verification: the unit needs the
+  // dependency's worker to have produced the files, not its report to be
+  // accepted. This is what lets GPU work start while a documentary tail is
+  // still in verification.
+  const artifactPending = (Array.isArray(unit.artifactDependsOn) ? unit.artifactDependsOn : [])
+    .filter((dep) => {
+      const owner = stepForUnit(state, dep)
+      return !owner || owner.status === "open"
+    })
+  const waits = []
+  if (pending.length) waits.push(`waits for ${pending.join(", ")}`)
+  if (artifactPending.length) waits.push(`waits for artifacts of ${artifactPending.join(", ")}`)
   const blockers = []
   // Step-level dependency gate: exactly the references foreman_step writes into
   // dependsOn, evaluated by the same matcher the tool runs. A dependency unit
@@ -1980,7 +2119,7 @@ function unitStepBarriers(state, unit) {
       })
     }
   }
-  return { pending, waits, blockers }
+  return { pending, artifactPending, waits, blockers }
 }
 // C3: a fan-in whose step already exists covers exactly the unit it shares with
 // another fan-in, never a unit private to this fan-in. Used by the per fan-in
@@ -2048,6 +2187,9 @@ function validateUnits(input, root) {
     if (raw.dependsOn !== undefined && !Array.isArray(raw.dependsOn)) {
       return { error: `REFUSED: unit ${id} dependsOn must be an array of unit ids.` }
     }
+    if (raw.artifactDependsOn !== undefined && !Array.isArray(raw.artifactDependsOn)) {
+      return { error: `REFUSED: unit ${id} artifactDependsOn must be an array of unit ids.` }
+    }
     if (raw.seam !== undefined && !Array.isArray(raw.seam)) {
       return { error: `REFUSED: unit ${id} seam must be an array of paths.` }
     }
@@ -2067,18 +2209,22 @@ function validateUnits(input, root) {
     const seam = normaliseScope(declaredSeam, root)
     const dependsOn = [...new Set((Array.isArray(raw.dependsOn) ? raw.dependsOn : [])
       .map((item) => String(item ?? "").trim()).filter(Boolean))]
+    const artifactDependsOn = [...new Set((Array.isArray(raw.artifactDependsOn) ? raw.artifactDependsOn : [])
+      .map((item) => String(item ?? "").trim()).filter(Boolean))]
     if (klass === "seam-parallel" && !seam.length) {
       return { error: `REFUSED: unit ${id} is seam-parallel but declares no seam. A seam-parallel unit needs the shared contract file it waits for.` }
     }
-    units.push({ id, title, class: klass, dependsOn, scope, seam })
+    units.push({ id, title, class: klass, dependsOn, artifactDependsOn, scope, seam })
   }
   for (const unit of units) {
-    for (const dep of unit.dependsOn) {
+    for (const dep of [...unit.dependsOn, ...unit.artifactDependsOn]) {
       if (dep === unit.id) return { error: `REFUSED: unit ${unit.id} depends on itself: the graph has a cycle (${unit.id} -> ${unit.id}).` }
       if (!seen.has(dep)) return { error: `REFUSED: unit ${unit.id} depends on unknown unit ${dep}. Every dependency must be a unit of this graph.` }
     }
   }
-  const cycle = findUnitCycle(units)
+  // Artifact edges are weaker, but a cycle among them still deadlocks the
+  // readiness gate: include them in the cycle check.
+  const cycle = findUnitCycle(units.map((unit) => ({ ...unit, dependsOn: [...unit.dependsOn, ...unit.artifactDependsOn] })))
   if (cycle) return { error: `REFUSED: the unit graph has a cycle: ${cycle.join(" -> ")}.` }
   // C3: the fan-in exists to close a batch, so it must name the units it fans
   // in; a dependency outside the graph is already refused above.
@@ -2142,7 +2288,7 @@ async function unitReadiness(state, unit, cwd, seamCache?: any) {
   // Every step-level barrier comes from the shared predicate, so status, the
   // offer gate and foreman_step cannot disagree.
   const barrier = unitStepBarriers(state, unit)
-  const pending = barrier.pending
+  const pending = [...barrier.pending, ...(barrier.artifactPending ?? [])]
   const waits = [...barrier.waits]
   const blockers = barrier.blockers.map((item) => item.reason)
   if (unit.class === "seam-parallel") {
@@ -2499,6 +2645,19 @@ export default Plugin.define({
           ? {}
           : { outputTail: clip(item.outputTail, 1_000) }),
       }))
+      const followUps = stringList(input?.followUps)
+      const failureClass = String(input?.failureClass ?? "").trim()
+      if (failureClass && !["product", "documentation", "environment", "harness"].includes(failureClass)) {
+        return { refusal: `REFUSED: failureClass must be product, documentation, environment or harness (got ${JSON.stringify(failureClass)}).` }
+      }
+      const blockingFindings = (Array.isArray(input?.blockingFindings) ? input.blockingFindings : [])
+        .filter(isObject)
+        .map((item) => ({
+          ...(Number.isInteger(Number(item.acceptance)) && Number(item.acceptance) > 0 ? { acceptance: Number(item.acceptance) } : {}),
+          ...(String(item.command ?? "").trim() ? { command: String(item.command).trim() } : {}),
+          evidence: clip(String(item.evidence ?? "").trim(), 1_000),
+        }))
+        .filter((item) => item.acceptance || item.command)
       const reportPath = String(input?.reportPath ?? "").trim()
       let transcript = String(input?.transcript ?? "").trim()
       if (reportPath) {
@@ -2525,6 +2684,9 @@ export default Plugin.define({
         ...(reportPath ? { reportPath: path.isAbsolute(reportPath) ? reportPath : path.resolve(root, reportPath) } : {}),
         notes: clip(String(input?.notes ?? "").trim(), 2_000),
         ...(evidenceLevel === undefined ? {} : { evidenceLevel }),
+        ...(followUps.length ? { followUps } : {}),
+        ...(blockingFindings.length ? { blockingFindings } : {}),
+        ...(failureClass ? { failureClass } : {}),
         at: nowIso(),
       }
       const metaCommand = String(input?.metaCommand ?? "").trim()
@@ -2543,12 +2705,59 @@ export default Plugin.define({
         store.writeStep(n, "step.json", step)
       }
       const acceptanceCommands = stored.length ? stored : fromInput
+      // Per-check inputs: a check that declares the paths it reads can reuse a
+      // passing receipt when those inputs did not change between attempts.
+      const inputChecks = normaliseChecks(input?.acceptanceChecks, [])
+      let acceptanceChecks = normaliseChecks(step.acceptanceChecks, [])
+      if (inputChecks.length) {
+        acceptanceChecks = inputChecks
+        step.acceptanceChecks = inputChecks
+        step.acceptanceCommands = inputChecks.map((check) => check.command)
+        store.saveState(state)
+        store.writeStep(n, "step.json", step)
+      } else if (!acceptanceChecks.length) {
+        acceptanceChecks = normaliseChecks([], acceptanceCommands)
+      }
+      const effectiveCommands = acceptanceChecks.length ? acceptanceChecks.map((check) => check.command) : acceptanceCommands
       const prepared = {
         n, verdict, commands, transcript, evidenceLevel, metaCommand, metaExitCode,
-        verify, acceptanceCommands,
+        verify, acceptanceCommands: effectiveCommands, acceptanceChecks,
+        receipts: isObject(step.acceptanceReceipts) ? { ...step.acceptanceReceipts } : {},
+        blockingFindings, followUps, failureClass,
         metaOutputTail: tail(input?.metaOutputTail ?? ""),
       }
-      if (verdict !== "good") return prepared
+      if (verdict !== "good") {
+        // A no-good is a claim that a blocking acceptance item is false. Prose,
+        // docs or out-of-scope polish are follow-ups, not blockers. Environment
+        // failures are their own class and never consume a fix attempt.
+        if (failureClass === "environment") return prepared
+        const known = new Set(effectiveCommands)
+        const failed = new Set(commands.filter((item) => Number(item.exitCode) !== 0).map((item) => item.command))
+        let resolved = blockingFindings.filter((item) =>
+          (item.acceptance && item.acceptance >= 1 && item.acceptance <= effectiveCommands.length)
+          || (item.command && (known.has(item.command) || failed.has(item.command))))
+        // A failing acceptance command is self-evidently a blocker: the plugin
+        // does not need the verifier to restate it. A custom probe that is not
+        // one of the acceptance commands still has to be mapped explicitly,
+        // which is what stops a failing grep on prose from becoming a fix cycle.
+        if (!resolved.length) {
+          resolved = commands
+            .filter((item) => Number(item.exitCode) !== 0 && known.has(item.command))
+            .map((item) => ({ command: item.command, evidence: item.outputTail || `exited ${item.exitCode}` }))
+        }
+        if (!resolved.length) {
+          return { refusal: [
+            "REFUSED: no-good must cite a blocking acceptance item or a failed command.",
+            `Pass blockingFindings: [{ acceptance: 1..${effectiveCommands.length || 0} }] or [{ command: "<one of the acceptance commands>" }] with the evidence.`,
+            "A documentary, prose or out-of-scope finding is not a blocker: record good with followUps instead.",
+          ].join("\n") }
+        }
+        verify.blockingFindings = resolved
+        return { ...prepared, blockingFindings: resolved }
+      }
+      if (blockingFindings.length) {
+        return { refusal: "REFUSED: good cannot carry blocking findings. Record no-good with the cited acceptance item, or move non-blocking items to followUps." }
+      }
       const bad = commands.filter((item) => Number(item.exitCode) !== 0)
       if (bad.length) return { refusal: `REFUSED: good requires every command to exit 0; ${bad.length} failed. Record no-good instead.` }
 
@@ -2573,7 +2782,7 @@ export default Plugin.define({
           "Commit or revert them before good.",
         ].join("\n") }
       }
-      if (!acceptanceCommands.length) {
+      if (!prepared.acceptanceCommands.length) {
         return { refusal: "REFUSED: good requires at least one acceptance command. Create steps with foreman_step acceptanceCommands, or pass acceptanceCommands here for a legacy step." }
       }
       return { ...prepared, cwd, headSha }
@@ -2581,8 +2790,8 @@ export default Plugin.define({
 
     // Runs under a fresh lock: the state is read again, so a step created while
     // the acceptance commands were running is never dropped by this save.
-    const recordGood = async (store, prepared, acceptanceRuns) => {
-      const { n, verify, evidenceLevel, acceptanceCommands } = prepared
+    const recordGood = async (store, prepared, acceptanceRuns, receipts) => {
+      const { n, verify, evidenceLevel, acceptanceCommands, acceptanceChecks = [], followUps = [] } = prepared
       const state = store.loadState()
       if (!state) return ok("REFUSED: no loop state. Run /foreman start <path-to-plan> first.")
       const step = state.steps.find((item) => Number(item.n) === n)
@@ -2629,10 +2838,14 @@ export default Plugin.define({
         ].join("\n"))
       }
 
+      const followUpIssues = await fileFollowUps(root, store, state, step, followUps)
       const accepted = {
         ...verify,
         acceptanceCommands,
+        ...(acceptanceChecks.length ? { acceptanceChecks } : {}),
         acceptanceRuns,
+        ...(followUps.length ? { followUps } : {}),
+        ...(followUpIssues.length ? { followUpIssues } : {}),
         metaOutputTail: prepared.metaOutputTail,
         ...(prepared.metaCommand ? { metaCommand: prepared.metaCommand } : {}),
         ...(prepared.metaExitCode === undefined ? {} : { metaExitCode: prepared.metaExitCode }),
@@ -2640,6 +2853,9 @@ export default Plugin.define({
       step.status = "verified"
       step.verifiedAt = nowIso()
       step.acceptanceCommands = acceptanceCommands
+      if (acceptanceChecks.length) step.acceptanceChecks = acceptanceChecks
+      step.acceptanceReceipts = receipts ?? prepared.receipts
+      if (followUpIssues.length) step.followUpIssues = [...(step.followUpIssues ?? []), ...followUpIssues]
       step.verify = accepted
       // Phase B1: a verified step leaves the pipeline, so its slot is free for
       // the next step. current is derived on save.
@@ -2653,8 +2869,9 @@ export default Plugin.define({
       await commentIssue(root, store, step.planIssue, [
         "Verified by the foreman.",
         "",
-        `- acceptance commands: ${acceptanceRuns.length} (all exit 0)`,
-        ...acceptanceRuns.map((item) => `  - \`${item.command}\` → 0 (${item.durationMs}ms)`),
+        `- acceptance commands: ${acceptanceRuns.length} (all exit 0, ${acceptanceRuns.filter((item) => item.reused).length} reused receipt(s))`,
+        ...acceptanceRuns.map((item) => `  - \`${item.command}\` → 0 (${item.durationMs}ms${item.reused ? ", reused" : ""})`),
+        followUpIssues.length ? `- follow-ups filed: ${followUpIssues.map((issue) => `#${issue}`).join(", ")}` : null,
         evidenceLevel === undefined ? null : `- evidence level: ${evidenceLevel}`,
         prepared.metaCommand ? `- meta command: \`${prepared.metaCommand}\` → ${prepared.metaExitCode ?? "(not declared)"}` : null,
         `- verifier commands: ${prepared.commands.length}`,
@@ -2689,7 +2906,7 @@ export default Plugin.define({
     // Runs under a fresh lock and re-checks the status: a no-good must attach to
     // the step as it is now, never to the snapshot taken before the lock.
     const recordNoGood = async (store, prepared) => {
-      const { n, verify, commands } = prepared
+      const { n, verify, commands, failureClass } = prepared
       const state = store.loadState()
       if (!state) return ok("REFUSED: no loop state. Run /foreman start <path-to-plan> first.")
       const step = state.steps.find((item) => Number(item.n) === n)
@@ -2698,29 +2915,77 @@ export default Plugin.define({
 
       store.writeStep(n, "verify.json", verify)
 
-      const failing = commands.find((item) => Number(item.exitCode) !== 0)
-      if (!failing) return ok("REFUSED: no-good requires at least one failing command with a non-zero exit code.")
-      // Retry is pure and unbounded (plan §1): a repeated failure signature
-      // never blocks the step. Every no-good creates a new fix issue and leaves
-      // the step fixing; the signature is recorded for forensics only.
-      const signature = sha256(`${failing.command}::${String(failing.outputTail ?? "").slice(0, 200)}`)
-
+      const failing = commands.find((item) => Number(item.exitCode) !== 0) ?? commands[0]
+      if (!failing && failureClass !== "environment") return ok("REFUSED: no-good requires at least one failing command with a non-zero exit code.")
+      const evidenceCommand = failing?.command ?? "(no command)"
+      const evidenceTail = String(failing?.outputTail ?? verify.notes ?? "")
+      // An environment failure is not a product defect and must not consume a
+      // fix attempt: no worker can fix a missing interpreter or an absent model.
+      if (failureClass === "environment") {
+        const setup = await createIssue(root, store, {
+          title: `[${loopNameOf(state)}] Setup — step ${stepCounter(state, n)}: ${step.title}`,
+          body: [
+            `# Setup — step ${step.n}`,
+            "",
+            `Part of #${step.planIssue}`,
+            "",
+            "The verifier could not exercise the product because the environment is missing something. This is not a fix attempt.",
+            "",
+            "## Evidence",
+            "",
+            `- Command: \`${evidenceCommand}\``,
+            `- Exit: ${failing?.exitCode ?? "(not declared)"}`,
+            "",
+            "```",
+            evidenceTail || "(no output)",
+            "```",
+            "",
+            "## Next",
+            "",
+            "Repair the environment, then unblock the loop with a `human` + `loop:" + loopNameOf(state) + "` issue and `foreman_steer(..., unblock: true)`.",
+            "",
+          ].join("\n"),
+          labels: ["foreman:setup", `step:${n}`, `loop:${loopNameOf(state)}`],
+        }, repoOf(state))
+        state.blocked = `environment failure on step ${n}: ${String(verify.notes ?? evidenceTail).slice(0, 300)}${setup.ok ? ` (issue #${setup.number})` : ""}`
+        clearDispatch(step)
+        delete state.nextWakeAt
+        store.saveState(state)
+        store.writeStep(n, "step.json", step)
+        store.appendLedger({ type: "blocked", step: n, issue: setup.ok ? setup.number : undefined, failureClass })
+        return ok(`BLOCKED step ${n}: environment failure.${setup.ok ? ` Setup issue #${setup.number} created.` : ""}\nRepair the environment, then unblock via the human channel. The step stays ${step.status}; no fix attempt was consumed.`)
+      }
+      // Retry is pure and unbounded for product defects: a repeated failure
+      // signature never blocks the step. It does escalate: the fix issue must
+      // land a committed falsification test, so the next verifier runs the
+      // suite instead of re-litigating the same prose.
+      const signature = sha256(`${evidenceCommand}::${String(evidenceTail).slice(0, 200)}`)
+      const previousSignatures = Array.isArray(step.rejectedSignatures) ? step.rejectedSignatures : []
+      const repeat = previousSignatures.filter((item) => item === signature).length
+      step.rejectedSignatures = [...previousSignatures, signature].slice(-20)
+      const followUpIssues = await fileFollowUps(root, store, state, step, prepared.followUps ?? [])
       const created = await createIssue(root, store, {
         title: `[${loopNameOf(state)}] Fix — step ${stepCounter(state, n)}: ${step.title}`,
-        body: fixBody({ step, verify, failing }),
+        body: fixBody({ step, verify, failing, repeat, blockingFindings: prepared.blockingFindings ?? [] }),
         labels: ["foreman:fix", `step:${n}`, `loop:${loopNameOf(state)}`],
       }, repoOf(state))
       if (!created.ok) return ok(`REFUSED: cannot create the fix issue: ${created.error}`)
       step.fixIssues = [...(step.fixIssues ?? []), created.number]
       step.status = "fixing"
+      step.acceptanceReceipts = prepared.receipts
+      if (followUpIssues.length) step.followUpIssues = [...(step.followUpIssues ?? []), ...followUpIssues]
       // The step changed status: its fix worker must be dispatchable again.
       clearDispatch(step)
       if (!state.active.includes(n)) state.active.push(n)
       delete state.nextWakeAt
       store.saveState(state)
       store.writeStep(n, "step.json", step)
-      store.appendLedger({ type: "rejected", step: n, issue: created.number, signature })
-      return ok(`REJECTED step ${n}: fix issue #${created.number} created.\nNext: dispatch_worker on #${created.number}.`)
+      store.appendLedger({
+        type: "rejected", step: n, issue: created.number, signature, repeat,
+        blocking: (prepared.blockingFindings ?? []).length,
+        ...(followUpIssues.length ? { followUps: followUpIssues.length } : {}),
+      })
+      return ok(`REJECTED step ${n}: fix issue #${created.number} created.${repeat ? ` Repeat failure (${repeat + 1}th time): the fix must include a committed falsification test.` : ""}${followUpIssues.length ? ` Follow-ups filed: ${followUpIssues.map((issue) => `#${issue}`).join(", ")}.` : ""}\nNext: dispatch_worker on #${created.number}.`)
     }
     await ctx.tool.transform((editor) => {
       editor.add({
@@ -3056,7 +3321,7 @@ export default Plugin.define({
 
       editor.add({
         name: "foreman_graph",
-        description: "Record the plan unit graph in state.units (plan C1). units: [{id, title, dependsOn (unit ids), scope (required, non-empty), seam, class: independent|seam-parallel|serial|integration}]. Every refusal happens before any write: duplicate or malformed ids, empty scope, unknown class, a seam-parallel unit without a seam, an integration unit without dependencies, a unit that is not integration and names a barrel in its scope, unknown dependency ids and cycles. The graph cannot be replaced once a step has taken a unit.",
+        description: "Record the plan unit graph in state.units (plan C1). units: [{id, title, dependsOn (unit ids that must be verified), artifactDependsOn (unit ids whose worker must have landed its files; verification may still be in flight), scope (required, non-empty), seam, class: independent|seam-parallel|serial|integration}]. Every refusal happens before any write: duplicate or malformed ids, empty scope, unknown class, a seam-parallel unit without a seam, an integration unit without dependencies, a unit that is not integration and names a barrel in its scope, unknown dependency ids and cycles (including artifact edges). The graph cannot be replaced once a step has taken a unit.",
         input: objectSchema({
           units: {
             type: "array",
@@ -3064,6 +3329,7 @@ export default Plugin.define({
               id: { type: "string", description: "Unit id: letters, digits, dot, dash or underscore, one token" },
               title: { type: "string", description: "Short unit title" },
               dependsOn: { type: "array", items: { type: "string" }, description: "Ids of the units that must be verified before this one" },
+              artifactDependsOn: { type: "array", items: { type: "string" }, description: "Ids of units whose worker must have landed its artifacts (step implemented) but whose verification may still be in flight. Use for GPU/data work that only needs the upstream files on disk, not its report." },
               scope: { type: "array", items: { type: "string" }, description: "Repo-relative files or directories the unit owns. Required, non-empty" },
               seam: { type: "array", items: { type: "string" }, description: "Shared contract files the unit waits for (required for seam-parallel)" },
               class: { type: "string", enum: UNIT_CLASSES, description: "independent runs immediately; serial waits for its units; seam-parallel waits for a verified seam on the branch; integration is the fan-in step (kind integration, the only step allowed to touch a barrel)" },
@@ -3094,7 +3360,7 @@ export default Plugin.define({
           const fanIn = validated.units.find((unit) => unit.class === "integration")
           return ok([
             `GRAPH recorded: ${validated.units.length} unit(s)`,
-            ...validated.units.map((unit) => `- ${unit.id} [${unit.class}]${unit.dependsOn.length ? ` after ${unit.dependsOn.join(", ")}` : ""}${unit.seam.length ? ` · seam ${unit.seam.join(", ")}` : ""} · scope ${unit.scope.join(", ")}`),
+            ...validated.units.map((unit) => `- ${unit.id} [${unit.class}]${unit.dependsOn.length ? ` after ${unit.dependsOn.join(", ")}` : ""}${unit.artifactDependsOn.length ? ` · artifacts ${unit.artifactDependsOn.join(", ")}` : ""}${unit.seam.length ? ` · seam ${unit.seam.join(", ")}` : ""} · scope ${unit.scope.join(", ")}`),
             fanIn ? `ORDER: create the integration step for unit ${fanIn.id} first, so its acceptance exists before the parallel workers start. It is not dispatched until ${fanIn.dependsOn.join(", ")} are verified; only it may hold a barrel.` : null,
             "Next: call foreman_next to be offered the first unit, then foreman_step with unitId.",
           ].filter((line) => line !== null).join("\n"))
@@ -3149,7 +3415,7 @@ export default Plugin.define({
             const cwd = store.workdir(state) ?? root
             for (const unit of units) {
               const readiness = await unitReadiness(state, unit, cwd)
-              unitLines.push(`  - ${unit.id} [${unit.class}]${unit.dependsOn.length ? ` after ${unit.dependsOn.join(", ")}` : ""}${unit.seam.length ? ` · seam ${unit.seam.join(", ")}` : ""} · ${unitStatusLabel(readiness)} · scope ${unit.scope.join(", ")}`)
+              unitLines.push(`  - ${unit.id} [${unit.class}]${unit.dependsOn.length ? ` after ${unit.dependsOn.join(", ")}` : ""}${Array.isArray(unit.artifactDependsOn) && unit.artifactDependsOn.length ? ` · artifacts ${unit.artifactDependsOn.join(", ")}` : ""}${unit.seam.length ? ` · seam ${unit.seam.join(", ")}` : ""} · ${unitStatusLabel(readiness)} · scope ${unit.scope.join(", ")}`)
             }
           }
           const humanPoll = await listHumanIssues(root, repoOf(state))
@@ -3175,6 +3441,11 @@ export default Plugin.define({
             stats.rejected
               ? `- fixes: ${(stats.fixMs / 60_000).toFixed(1)} min (${stats.fixWindows} closed window(s), rejected verdict to the next result of the same step)`
               : "- fixes: n/a (no rejected verdict)",
+            (() => {
+              const followUps = steps.reduce((total, step) => total + (Array.isArray(step.followUpIssues) ? step.followUpIssues.length : 0), 0)
+              const repeats = steps.reduce((total, step) => total + Math.max(0, (Array.isArray(step.rejectedSignatures) ? step.rejectedSignatures.length : 0) - 1), 0)
+              return followUps || repeats ? `- follow-ups: ${followUps} filed · repeat failures: ${repeats}` : null
+            })(),
             stats.parallel.windows
               ? `- parallelism: peak ${stats.parallel.peak} worker(s) · ${(stats.parallel.overlapMs / 60_000).toFixed(1)} min with 2+ · ${(100 * stats.parallel.overlapMs / Math.max(1, stats.parallel.elapsedMs)).toFixed(1)}% of elapsed (${stats.parallel.windows} run(s))`
               : "- parallelism: none yet (no dispatch recorded)",
@@ -3399,6 +3670,9 @@ export default Plugin.define({
               `PLAN: ${state.planPath}`,
               unit.dependsOn.length
                 ? `DEPENDS_ON_UNITS: ${unit.dependsOn.join(", ")} ${entry.pending.length ? `(pending: ${entry.pending.join(", ")})` : "(verified)"}`
+                : null,
+              Array.isArray(unit.artifactDependsOn) && unit.artifactDependsOn.length
+                ? `ARTIFACT_DEPENDS_ON: ${unit.artifactDependsOn.join(", ")} (needs the worker's files, not its verdict)`
                 : null,
               unit.seam.length
                 ? (seam?.ok
@@ -3634,13 +3908,23 @@ export default Plugin.define({
 
       editor.add({
         name: "foreman_step",
-        description: "Create the Issue (Plan) for one step, label it foreman:plan + step:N, and add it to state.active. Guards run in this order: STOP/blocked/budget -> capacity (open/fixing workers < maxParallel and the total pipeline < maxParallel + maxVerify, a held fan-in excluded) -> title and goal -> acceptanceCommands -> unit (with a graph unitId is required; the unit must exist, not be taken by another step and not be verified; one shared barrier predicate then decides: dependency units verified except the integration unit, whose acceptance is taken first, every fan-in that depends on this unit already has its acceptance step, and no dependency plan issue is still owned by an unfinished step) -> dependsOn (every step of this loop it names must be verified) -> kind (only \"integration\" or unset; with a graph it is derived from the unit class) -> scope (normalised, absolute paths resolved against the loop root, no overlap with an active step, barrels only for an integration step). Nothing is created when a guard refuses.",
+        description: "Create the Issue (Plan) for one step, label it foreman:plan + step:N, and add it to state.active. acceptance is the blocking contract; followUps are filed as non-blocking issues and never gate the step. acceptanceChecks may declare per-command inputs for receipt reuse. Guards run in this order: STOP/blocked/budget -> capacity (open/fixing workers < maxParallel and the total pipeline < maxParallel + maxVerify, a held fan-in excluded) -> title and goal -> acceptanceCommands -> unit (with a graph unitId is required; the unit must exist, not be taken by another step and not be verified; one shared barrier predicate then decides: dependency units verified except the integration unit, whose acceptance is taken first, every fan-in that depends on this unit already has its acceptance step, and no dependency plan issue is still owned by an unfinished step) -> dependsOn (every step of this loop it names must be verified) -> kind (only \"integration\" or unset; with a graph it is derived from the unit class) -> scope (normalised, absolute paths resolved against the loop root, no overlap with an active step, barrels only for an integration step). Nothing is created when a guard refuses.",
         input: objectSchema({
           title: { type: "string", description: "Short step title" },
           goal: { type: "string", description: "What the step must achieve, from the plan" },
           planRef: { type: "string", description: "Exact plan section for this step: a 1-based line range such as \"120-260\" (preferred) or a heading. The issue tells the worker/verifier how to read it in full." },
-          acceptance: { type: "array", items: { type: "string" }, description: "Falsifiable acceptance criteria" },
+          acceptance: { type: "array", items: { type: "string" }, description: "Falsifiable, blocking acceptance criteria. Prose, docs, provenance wording and out-of-scope polish belong in followUps, not here." },
           acceptanceCommands: { type: "array", items: { type: "string" }, description: "Exact shell commands from the plan. Required: the plugin runs them sequentially in the loop checkout before good." },
+          acceptanceChecks: {
+            type: "array",
+            items: objectSchema({
+              command: { type: "string" },
+              inputs: { type: "array", items: { type: "string" }, description: "Paths whose fingerprints invalidate this check's passing receipt. Omit for the whole checkout." },
+              serialGroup: { type: "string", description: "Commands sharing a group must not overlap (local database, port); read-only groups may run in parallel." },
+            }, ["command"]),
+            description: "Optional per-command inputs for receipt reuse. A check whose declared input fingerprints are unchanged since its last passing run is recorded as reused instead of re-run. When present, these are the step's commands.",
+          },
+          followUps: { type: "array", items: { type: "string" }, description: "Non-blocking findings (docs, prose, provenance wording, out-of-scope polish). Each becomes a foreman:followup issue and never gates the step or the plan." },
           unitId: { type: "string", description: "Plan unit id. Required when the loop has a graph (foreman_graph): the step implements that unit and only that unit." },
           scope: { type: "array", items: { type: "string" }, description: "Repo-relative files or directories the step may touch. An absolute path is resolved against the loop root; a path outside the root collapses to the whole-repository scope (conservative, overlaps everything)." },
           dependsOn: { type: "array", items: { type: "string" }, description: "Issue references this step depends on. Steps of this loop must be verified; unknown numbers become external dependencies." },
@@ -3673,9 +3957,12 @@ export default Plugin.define({
           const title = String(input?.title ?? "").trim()
           const goal = String(input?.goal ?? "").trim()
           if (!title || !goal) return ok("REFUSED: title and goal are required.")
-          const acceptanceCommands = Array.isArray(input?.acceptanceCommands)
+          const rawCommands = Array.isArray(input?.acceptanceCommands)
             ? input.acceptanceCommands.map((item) => String(item ?? "")).filter((item) => item.trim())
             : []
+          const acceptanceChecks = normaliseChecks(input?.acceptanceChecks, [])
+          const acceptanceCommands = acceptanceChecks.length ? acceptanceChecks.map((check) => check.command) : rawCommands
+          const followUps = stringList(input?.followUps)
           if (!acceptanceCommands.length) return ok(ACCEPT_REQUIRED)
           // Phase C1: with a graph every step comes from a unit, and a unit has
           // exactly one step. Legacy loops (no graph) keep accepting unitId as
@@ -3704,6 +3991,9 @@ export default Plugin.define({
             const barrier = unitStepBarriers(state, unit)
             if (unit.class !== "integration" && barrier.pending.length) {
               return ok(`REFUSED: unit ${unit.id} waits for ${barrier.pending.join(", ")}: only verified dependency units may be taken.`)
+            }
+            if (unit.class !== "integration" && barrier.artifactPending.length) {
+              return ok(`REFUSED: unit ${unit.id} waits for artifacts of ${barrier.artifactPending.join(", ")}: the dependency's worker must land them first (its verification may still be in flight).`)
             }
             if (barrier.blockers.length) {
               const first = barrier.blockers[0]
@@ -3760,7 +4050,7 @@ export default Plugin.define({
             }
           }
           const body = stepBody({
-            n, title, goal, acceptance, acceptanceCommands, scope, dependsOn, planRef,
+            n, title, goal, acceptance, acceptanceCommands, acceptanceChecks, followUps, scope, dependsOn, planRef,
             externalDependencies: dependency.external,
             externalDependencyNumbers: dependency.externalNumbers,
             state,
@@ -3776,8 +4066,12 @@ export default Plugin.define({
             labels: ["foreman:plan", `step:${n}`, `loop:${loopName}`],
           }, repoOf(state))
           if (!created.ok) return ok(`REFUSED: GitHub issue creation failed: ${created.error}`)
+          const followUpIssues = await fileFollowUps(root, store, state, { n, planIssue: created.number }, followUps)
           const step = {
             n, title, goal, planRef: planRef || undefined, acceptance, acceptanceCommands, unitId: rawUnitId || undefined, scope, dependsOn,
+            ...(acceptanceChecks.length ? { acceptanceChecks } : {}),
+            ...(followUps.length ? { followUps } : {}),
+            ...(followUpIssues.length ? { followUpIssues } : {}),
             externalDependencies: dependency.external,
             externalDependencyNumbers: dependency.externalNumbers,
             ...(kind ? { kind } : {}),
@@ -3800,6 +4094,8 @@ export default Plugin.define({
             planRef ? `- plan section: ${planRef} (the issue contains the exact read command)` : null,
             unit?.class === "integration" ? `- fan-in: the acceptance for ${unit.id} is recorded now, before the parallel workers start. This step is held until ${unit.dependsOn.join(", ")} are verified, and it is the only step allowed to hold a barrel.` : null,
             `- acceptance commands: ${acceptanceCommands.length} (executed by the plugin before good)`,
+            acceptanceChecks.length ? `- acceptance checks: ${acceptanceChecks.length} with declared inputs (unchanged inputs reuse a passing receipt)` : null,
+            followUps.length ? `- follow-ups (non-blocking): ${followUps.length}${followUpIssues.length ? ` — filed as ${followUpIssues.map((issue) => `#${issue}`).join(", ")}` : ""}` : null,
             dependency.external.length ? `- external dependencies: ${dependency.external.join(", ")} (annotated in the issue)` : null,
             dependency.externalNumbers.length ? `- external numbers: ${dependency.externalNumbers.map((issue) => `#${issue}`).join(", ")} (annotated in the issue)` : null,
             `Next: dispatch_worker for issue #${created.number}.`,
@@ -4021,7 +4317,7 @@ export default Plugin.define({
 
       editor.add({
         name: "foreman_verify",
-        description: "Record a verifier verdict. good runs the step's acceptanceCommands sequentially in the loop's own checkout (one run at a time per loop) and closes the step only when all exit 0; a cherry-pick that moves HEAD during the run is re-run once on the new commit, a second move refuses. no-good requires failing evidence and creates the Issue (Fix) with the previous attempt's commit and worktree. Every no-good, even a byte-identical repeat of the same failure, creates a new fix issue and leaves the step fixing: retry is infinite and nothing is blocked. evidenceLevel (0-5) records the rung the verifier reached; on good the step's worktree is removed and pruned, best effort.",
+        description: "Record a verifier verdict. good runs the step's blocking acceptance checks sequentially in the loop's own checkout (one run at a time per loop) and closes the step only when all exit 0; a check with unchanged declared inputs and a passing receipt is reused instead of re-run. A cherry-pick that moves HEAD during the run is re-run once on the new commit, a second move refuses. good may carry followUps: each is filed as a foreman:followup issue and never gates the step. no-good must cite a blocking acceptance item (1-based index) or a failing command via blockingFindings, or it is refused; it then creates the Issue (Fix) with the previous attempt's commit and worktree. A repeated failure signature escalates the fix issue to a committed falsification test. failureClass environment opens a foreman:setup issue and blocks the loop without consuming a fix attempt. evidenceLevel (0-5) records the rung the verifier reached; on good the step's worktree is removed and pruned, best effort.",
         input: objectSchema({
           step: { type: "integer", minimum: 1, description: "Step number" },
           verdict: { type: "string", enum: ["good", "no-good"], description: "Verifier verdict" },
@@ -4039,6 +4335,26 @@ export default Plugin.define({
           reportPath: { type: "string", description: "Path to the verifier's full report file. The plugin reads a bounded tail; use it instead of pasting the whole report into the transcript." },
           transcript: { type: "string", description: "What a real user observed (short summary; optional when reportPath is provided)" },
           notes: { type: "string", description: "What is still untested" },
+          followUps: { type: "array", items: { type: "string" }, description: "Non-blocking findings: each becomes a foreman:followup issue and never gates the verdict. Use for prose, docs, provenance wording and out-of-scope polish." },
+          blockingFindings: {
+            type: "array",
+            items: objectSchema({
+              acceptance: { type: "integer", minimum: 1, description: "1-based index into the step's blocking acceptance criteria" },
+              command: { type: "string", description: "An acceptance command or a verifier command with a non-zero exit that proves the blocker" },
+              evidence: { type: "string", description: "The observed failure" },
+            }),
+            description: "Required for no-good: each finding must cite a blocking acceptance item (1-based index) or a failing command. A no-good without one is refused.",
+          },
+          failureClass: { type: "string", enum: ["product", "documentation", "environment", "harness"], description: "Failure class. environment records a setup issue and blocks the loop without consuming a fix attempt; documentation/prose findings belong in followUps." },
+          acceptanceChecks: {
+            type: "array",
+            items: objectSchema({
+              command: { type: "string" },
+              inputs: { type: "array", items: { type: "string" }, description: "Paths whose fingerprints invalidate this check's passing receipt. Omit for the whole checkout." },
+              serialGroup: { type: "string", description: "Commands sharing a group must not overlap (local database, port); read-only groups may run in parallel." },
+            }, ["command"]),
+            description: "Optional per-command inputs. A passing receipt with the same input fingerprints is reused instead of re-running the command. For legacy steps this also persists the checks on the step.",
+          },
           metaCommand: { type: "string", description: "Kept for compatibility: recorded, but no longer decides the verdict" },
           metaExitCode: { type: "integer", description: "Kept for compatibility: recorded, but no longer decides the verdict" },
           metaOutputTail: { type: "string", description: "Kept for compatibility: last lines of the legacy meta command" },
@@ -4062,8 +4378,8 @@ export default Plugin.define({
           // 1.4-minute re-run is cheaper than the refused tick it used to cost.
           let current = plan
           for (let attempt = 0; attempt < 2; attempt += 1) {
-            const acceptanceRuns = await withAcceptance(store.paths.dir, () => runAcceptance(current.cwd, current.acceptanceCommands, ACCEPT_TIMEOUT_MS))
-            const recorded = await store.withState(async () => recordGood(store, current, acceptanceRuns))
+            const { runs: acceptanceRuns, receipts } = await withAcceptance(store.paths.dir, () => runAcceptanceChecks(current.cwd, current.acceptanceChecks, ACCEPT_TIMEOUT_MS, current.receipts, current.headSha))
+            const recorded = await store.withState(async () => recordGood(store, current, acceptanceRuns, receipts))
             if (!headMoved(recorded) || attempt === 1) return recorded
             const again = await store.withState(async () => ({ value: await prepareVerify(store, input) }))
             if (!again.value || again.value.refusal || again.value.verdict !== "good") {

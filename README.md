@@ -33,8 +33,17 @@ network, no real `gh` — and asserts every guardrail.
   work in dependency order and refuses overlapping scopes.
 - **Parallel workers.** Each step runs in its own git worktree, launched with
   `background: true`, so the loop keeps creating and verifying while workers run.
-- **A real verifier.** `foreman_verify` re-runs the acceptance commands and records
+- **A real verifier.** `foreman_verify` re-runs the blocking acceptance and records
   evidence; a verified step retires its worktree.
+- **Blocking vs follow-up.** A `no-good` must cite the blocking acceptance item
+  or the failing command; prose, docs and provenance wording become
+  `foreman:followup` issues and never hold a step hostage.
+- **Delta verification.** `acceptanceChecks` declare what each command reads; a
+  passing receipt with unchanged input fingerprints is reused, so a report-only
+  fix does not re-run the data pipeline.
+- **Artifact dependencies.** A unit can wait for an upstream worker's files
+  (`artifactDependsOn`) without waiting for that unit's verification, so GPU and
+  data work start while the report is still being accepted.
 - **A GitHub ledger.** Steps, plans, fixes and human steering all live as issues,
   pinned to the repository the directory points at.
 - **A human channel.** An open issue labelled `human` **and** `loop:<Loop>` is a

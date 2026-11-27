@@ -33,14 +33,18 @@ Read the `always-awake-agent` skill before the first action of every tick.
   `origin` and an ambient `GH_REPO` cannot divert it.
 - Workers and verifiers are always **fresh** subagents. Never reuse a worker
   session for a verifier, and never let a verifier see the worker transcript.
-- Every acceptance you write carries an external oracle: a declared range/unit
-  for each measured quantity and an equivalence test for every pair of code
-  paths that share a declared invariant. A number that only reproduces is
-  unchecked; `deferred` and `tolerated` are not an acceptance.
+- Every **blocking** acceptance you write carries an external oracle: a declared
+  range/unit for each measured quantity and an equivalence test for every pair
+  of code paths that share a declared invariant. A number that only reproduces
+  is unchecked; `deferred` and `tolerated` are not an acceptance. Prose,
+  documentation, provenance wording and out-of-scope polish go in `followUps`,
+  never in the blocking acceptance.
 - You accept `good` only after the plugin's acceptance run exits 0 on the
   current `HEAD`, in the loop's own checkout, **and** the verifier left no
-  unresolved anomaly. A defect, an unexplained divergence or a limitation on the
-  accepted sub-claim is a fix issue, not a pass.
+  unresolved **blocking** anomaly. A defect, an unexplained divergence or a
+  limitation on the accepted sub-claim is a fix issue; a documentary remark is a
+  `foreman:followup` issue. A `no-good` must cite the blocking acceptance item
+  or the failing command; the plugin refuses one that does not.
 - You stop only on `.foreman/STOP` or `/foreman stop`.
 
 ## How the loop starts
@@ -140,8 +144,11 @@ still serialised per loop (shared checkout and local database).
   `acceptanceCommands` (the plugin does, one at a time per loop); it checks the
   oracle (declared range/unit per measured quantity, equivalence for
   shared-invariant paths), recomputes at least one value with its own code, and
-  returns `no-good` if any anomaly remains unresolved. It writes the full report
-  to `verify-report.md` and returns a short summary plus the `REPORT:` path.
+  returns `no-good` only for a **blocking** anomaly, citing the acceptance index
+  or failing command; prose and docs become `followUps`. It verifies the delta
+  against the previous `verify.json` and does not re-prove inputs the plugin's
+  receipts declare unchanged. It writes the full report to `verify-report.md`
+  and returns a short summary plus the `REPORT:` path.
 - A `dispatch_worker` that arrives in a tick while another worker is already
   running is normal: the background worker keeps running, the new one starts
   immediately.
@@ -168,7 +175,9 @@ still serialised per loop (shared checkout and local database).
   tree would conflict or revert newer work).
 - The plugin executes the step `acceptanceCommands` itself, sequentially in the
   loop's own checkout, before it can record `good`. You never need to run them
-  by hand, and a failing run refuses the verdict.
+  by hand, and a failing run refuses the verdict. When a step declares
+  `acceptanceChecks` inputs, a passing receipt whose fingerprints are unchanged
+  is reused; a doc-only delta does not re-run the data pipeline.
 - The loop only commits on its own branch. The configured publish branch is the
   sacred branch: when the plan is complete `foreman_publish` merges the loop
   branch there, pushes it and moves the running stack onto it; state which merge
@@ -182,9 +191,13 @@ still serialised per loop (shared checkout and local database).
 - Never edit the plan to make a step easier.
 - Never accept a worker's word without a commit, command and exit code.
 - Never accept a verifier that did not run the product.
-- Never write an acceptance with no external oracle, and never treat a
-  "reproducible" number as checked.
-- Never record `good` for a step while a described anomaly is unresolved: open
-  the fix issue instead.
-- Never close a step whose acceptance criteria are not all checked.
+- Never write a **blocking** acceptance with no external oracle, and never treat
+  a "reproducible" number as checked.
+- Never record `good` for a step while a **blocking** anomaly is unresolved:
+  open the fix issue instead. A documentary remark is a follow-up, not a blocker.
+- Never record `no-good` without citing the blocking acceptance item or the
+  failing command; the plugin refuses it.
+- Never re-litigate the same failure class: after a repeat, the fix must land a
+  committed falsification test and the next verdict tests that suite.
+- Never close a step whose blocking acceptance criteria are not all checked.
 - Never ask the user for direction while an actionable step exists.

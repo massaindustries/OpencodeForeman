@@ -89,11 +89,19 @@ own test plan, so it cannot be steered by the implementation.
    share an invariant (engine vs port, read vs write, fitter vs grid, cached vs
    recomputed) carries an equivalence test on shared inputs. See *Acceptance
    oracles* below.
-9. **No `good` carries an open anomaly.** A defect, an unexplained divergence or
-   a limitation on the accepted sub-claim that the verifier describes — in NOTES,
-   in the report or in the transcript — is a finding, not a pass: the verdict is
-   `no-good` (a fix issue) or the anomaly is filed as its own issue before the
-   step is accepted. `deferred` and `tolerated` are not verdicts.
+9. **No `good` carries an open *blocking* anomaly.** Classify every finding
+   before deciding the verdict:
+
+   | Finding | Example | Verdict |
+   | --- | --- | --- |
+   | **Blocker** | a declared acceptance item is false, a gate command fails, a contract is broken, a number is outside its declared range | `no-good` + `blockingFindings` citing the 1-based acceptance index or the failing command |
+   | **Follow-up** | prose, report wording, provenance phrasing, docs, out-of-scope polish, a limitation already declared as not claimed | `good` + `followUps`; the plugin files a `foreman:followup` issue |
+
+   A `no-good` without a blocking finding is refused by the plugin: record
+   `good` with `followUps` instead. An environment failure (missing interpreter,
+   absent model, unreachable service) is `failureClass: "environment"`: it opens
+   a setup issue and blocks the loop without consuming a fix attempt. `deferred`
+   and `tolerated` are not verdicts, but a declared non-claim is a follow-up.
 
 ## Tick contract
 
@@ -110,10 +118,12 @@ question unless the loop is blocked.
    verbatim, then pass the same line range to `foreman_step` as `planRef`.
 3. Execute every returned action:
    - `create_step` → `foreman_step` with `unitId` when a graph exists, plus
-     title, goal, acceptance, `acceptanceCommands` and scope. Every acceptance
-     carries an external oracle (see *Acceptance oracles*): a declared range/unit
-     for each measured quantity and an equivalence test for each pair of
-     shared-invariant paths. A tick can offer
+     title, goal, **blocking** `acceptance`, `acceptanceCommands` (or
+     `acceptanceChecks` with per-command `inputs`) and scope. Put prose, docs and
+     provenance wording in `followUps`, never in `acceptance`. Every blocking
+     acceptance carries an external oracle (see *Acceptance oracles*): a declared
+     range/unit for each measured quantity and an equivalence test for each pair
+     of shared-invariant paths. A tick can offer
      several (up to the free worker budget): call `foreman_step` once per
      action.
    - `dispatch_worker` → `subagent` (agent `general`) with the worker brief
@@ -218,9 +228,18 @@ Check the oracle, not only the artifact: for every measured quantity in the
 acceptance confirm the value is inside the declared range/unit, and for every
 pair of paths declared to share an invariant run the equivalence check.
 Recompute at least one value with your own code from the inputs; re-running the
-artifact's own script is not independent. If anything you would write in NOTES
-is a defect, an unexplained divergence or a limitation on the accepted
-sub-claim, the verdict is `no-good`: `good` must not carry an unresolved anomaly.
+artifact's own script is not independent.
+Verify the **delta**: read the step's previous `verify.json` (the dispatch names
+it) and the `git diff` against that commit. Re-check the changed claims and one
+previously accepted value as a regression; do not re-prove inputs the plugin
+declares unchanged (its `acceptanceChecks` fingerprints already cover them).
+Classify every finding. A **blocker** falsifies a blocking acceptance item or a
+gate command: record `no-good` and pass `blockingFindings` with the 1-based
+acceptance index (or the failing command) and the evidence. A **follow-up** —
+prose, docs, provenance wording, out-of-scope polish — is `good` with
+`followUps`; the plugin files it as an issue. `good` must not carry an unresolved
+*blocking* anomaly; it may carry follow-ups. If the environment itself is
+missing something, use `failureClass: "environment"`.
 Start any scratch server on a free port and stop it before you report; never
 leave a listener behind and never restart the shared stack.
 Write the full report to `verify-report.md` in that worktree; return a short
@@ -232,6 +251,8 @@ EVIDENCE_LEVEL: <0-5>
 COMMANDS: max 5, the exact command, exit code and last 5 lines
 TRANSCRIPT: what a real user would observe, max 10 lines
 REPORT: <absolute path of verify-report.md>
+BLOCKING: only for no-good; the acceptance index or failing command and the evidence
+FOLLOW_UPS: non-blocking items, one per line (they become issues)
 NOTES: what is still untested, max 10 lines
 ```
 
@@ -246,6 +267,14 @@ exit 124. After the run it resolves `HEAD` again: if the commit moved (a
 parallel worker's result was cherry-picked), the plugin re-prepares and re-runs
 the acceptance once on the new commit, so the verdict lands on the tree it
 actually proved; a second move returns a refusal.
+
+A step may declare `acceptanceChecks` (per-command `inputs`). The plugin
+fingerprints those inputs and, when a passing receipt exists for the same
+fingerprint, records the check as `reused` instead of running it again. A
+doc-only fix therefore does not re-run the data pipeline; a code or data change
+invalidates the receipt. On `good` the plugin files every `followUps` item as a
+`foreman:followup` issue before closing the step; a `no-good` is refused unless
+it cites a blocking acceptance item or a failing command.
 
 `evidenceLevel` (0-5) is stored in `verify.json`. `metaCommand`/`metaExitCode`
 are still accepted for compatibility but no longer decide the verdict.
@@ -307,8 +336,19 @@ acceptance before dispatch, never after a failure.
 - **Independent recomputation.** The verifier recomputes at least one value with
   its own code from the inputs, instead of re-running the artifact's script; a
   re-run of the same script shares its failure modes and cannot falsify it.
+- **Blocking only.** `acceptance` is the blocking contract: each item must be
+  falsifiable by a command or a named oracle. Prose, documentation, provenance
+  wording and out-of-scope polish go in `followUps`, never in `acceptance`.
+  A generated report (or a committed claims test) is preferred over a hand-
+  written one: a claim the code cannot reproduce is a follow-up, not a gate.
+- **Inputs, not attempts.** Declare `acceptanceChecks` with the paths each
+  command reads. The plugin reuses a passing receipt when those fingerprints are
+  unchanged, so a report-only delta does not re-run the suite. A receipt is
+  invalidated by any change to the declared inputs.
 
-A step whose acceptance has no oracle is an incomplete step.
+A step whose acceptance has no oracle is an incomplete step. A step whose
+blocking acceptance is mostly prose is also incomplete: move the prose to
+`followUps` before dispatch.
 
 ## Evidence contract
 
@@ -323,8 +363,13 @@ Accepted only when all of these are present:
 
 Rejected: "it works", screenshots without a command, a passing test that was
 weakened, a mock-only proof, an uncommitted change, a verdict recorded while
-`HEAD` moved, a `good` that carries a described anomaly, an acceptance with no
-external oracle.
+`HEAD` moved, a `good` that carries an unresolved **blocking** anomaly, a
+`no-good` that cannot name the blocking acceptance item or failed command, an
+acceptance with no external oracle.
+
+A `good` may carry follow-ups: they are filed as `foreman:followup` issues and
+do not gate the step or the plan. `foreman_publish` warns about open follow-ups
+but does not refuse the merge.
 
 ## Planner brief (graph plans)
 
@@ -334,7 +379,8 @@ Read the plan, then call `foreman_graph` once with the units in plan order:
 | --- | --- |
 | `id` | one token: letters, digits, dot, dash, underscore |
 | `title` | short unit title |
-| `dependsOn` | ids of units of the same graph that must be verified first |
+| `dependsOn` | ids of units of the same graph that must be **verified** first |
+| `artifactDependsOn` | ids whose **worker must have landed the files** first; the dependency's verification may still be in flight. Use for GPU/data work that only needs the upstream artifacts, not its report. |
 | `scope` | required, non-empty: files/directories the unit owns |
 | `seam` | shared contract files; required for `seam-parallel` |
 | `class` | `independent`, `seam-parallel`, `serial`, `integration` |
@@ -403,12 +449,16 @@ for the serial verifier while the other workers keep running.
   checkout with `HEAD` on the loop branch, so parallel workers never share a
   tree. A cherry-pick that moves `HEAD` during the plugin's acceptance run is
   re-run once automatically instead of costing a refused tick.
-- **Retry is infinite:** every `no-good` creates a new fix issue, moves the step
-  to `fixing` and never blocks. The fix issue names the previous attempt's
-  commit and worktree: the worker resets that worktree to the branch tip and
-  keeps its `node_modules` instead of starting over. A repeated failure
-  signature is recorded in the ledger for forensics only; it never stops the
-  loop. Only a human decision, STOP or an exhausted budget blocks.
+- **Retry is infinite for blockers:** every `no-good` creates a new fix issue,
+  moves the step to `fixing` and never blocks. The fix issue names the previous
+  attempt's commit and worktree: the worker resets that worktree to the branch
+  tip and keeps its `node_modules` instead of starting over. A repeated failure
+  signature is recorded in the ledger **and escalates**: the fix issue requires
+  a committed falsification test that fails on the current tree and passes after
+  the fix, added to the acceptance. The next verifier runs that suite instead of
+  re-litigating the same prose. Only a human decision, STOP, an environment
+  failure or an exhausted budget blocks. Prose is never a fix attempt: it is a
+  follow-up.
 - **Issue titles** are created by the plugin, not by you: `[<Plan>] Step <n>/<total>`
   for the plan issue, `[<Plan>] Implementation results — step <n>/<total>` and
   `[<Plan>] Fix — step <n>/<total>` for the others, plus `step:<n>` and

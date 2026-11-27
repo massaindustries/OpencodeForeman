@@ -21,6 +21,7 @@
  */
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -446,6 +447,180 @@ await scenario(`timeout: a command killed after ${ACCEPT_TIMEOUT_MS}ms is record
   const verify = readStep(repo, 1, "verify.json")
   assert.equal(verify.acceptanceRuns[0].exitCode, 124)
   assert.equal(readStep(repo, 1).status, "implemented")
+})
+
+await scenario("triage: step followUps are filed as non-blocking issues", async () => {
+  const repo = makeRepo()
+  writeState(repo, {})
+  const tools = await loadTools(repo.dir)
+  const message = await call(tools, "foreman_step", {
+    title: "blocking plus docs",
+    goal: "prove the split",
+    acceptance: ["the command exits 0"],
+    acceptanceCommands: ["echo ok"],
+    followUps: ["report wording", "provenance note"],
+    scope: ["README.md"],
+  })
+  assert.match(message, /^STEP 1 created/)
+  assert.match(message, /follow-ups \(non-blocking\): 2/)
+  let step = readStep(repo, 1)
+  assert.deepEqual(step.followUps, ["report wording", "provenance note"])
+  assert.equal(step.followUpIssues.length, 2)
+  await call(tools, "foreman_result", {
+    step: 1, commit: repo.head, command: "echo ok", exitCode: 0, summary: "worker did it",
+  })
+  const verified = await call(tools, "foreman_verify", {
+    step: 1, verdict: "good",
+    commands: [{ command: "echo ok", exitCode: 0 }],
+    transcript: "user saw the command pass",
+    followUps: ["a new documentary remark"],
+  })
+  assert.match(verified, /^VERIFIED step 1\./)
+  step = readStep(repo, 1)
+  assert.equal(step.status, "verified")
+  assert.equal(step.followUpIssues.length, 3, "the verify-time follow-up is filed too")
+  assert.equal(step.verify.followUps.length, 1)
+  assert.ok(fs.readFileSync(ghLog, "utf8").includes("foreman:followup"))
+})
+
+await scenario("triage: no-good without a blocking finding is refused", async () => {
+  const repo = makeRepo()
+  writeState(repo, {})
+  const tools = await loadTools(repo.dir)
+  await call(tools, "foreman_step", {
+    title: "prose is not a blocker",
+    goal: "prove the gate",
+    acceptance: ["the command exits 0"],
+    acceptanceCommands: ["echo ok"],
+    scope: ["README.md"],
+  })
+  await call(tools, "foreman_result", {
+    step: 1, commit: repo.head, command: "echo ok", exitCode: 0, summary: "worker did it",
+  })
+  const refused = await call(tools, "foreman_verify", {
+    step: 1, verdict: "no-good",
+    commands: [{ command: "grep -q nothing-here README.md", exitCode: 1 }],
+    transcript: "the report wording is imprecise",
+    notes: "a sentence is imprecise",
+  })
+  assert.match(refused, /^REFUSED: no-good must cite a blocking acceptance item or a failed command\./)
+  assert.equal(readStep(repo, 1).status, "implemented")
+  assert.equal((readStep(repo, 1).fixIssues ?? []).length, 0)
+
+  const rejected = await call(tools, "foreman_verify", {
+    step: 1, verdict: "no-good",
+    commands: [{ command: "grep -q nothing-here README.md", exitCode: 1 }],
+    transcript: "the product is wrong",
+    blockingFindings: [{ acceptance: 1, evidence: "the declared command did not exit 0" }],
+  })
+  assert.match(rejected, /^REJECTED step 1: fix issue #\d+ created\./)
+  const step = readStep(repo, 1)
+  assert.equal(step.status, "fixing")
+  assert.equal(step.fixIssues.length, 1)
+  assert.equal(readStep(repo, 1, "verify.json").blockingFindings.length, 1)
+})
+
+await scenario("triage: good cannot carry a blocking finding", async () => {
+  const repo = makeRepo()
+  writeState(repo, {})
+  const tools = await loadTools(repo.dir)
+  await call(tools, "foreman_step", {
+    title: "good plus blocker",
+    goal: "refuse the contradiction",
+    acceptance: ["the command exits 0"],
+    acceptanceCommands: ["echo ok"],
+    scope: ["README.md"],
+  })
+  await call(tools, "foreman_result", {
+    step: 1, commit: repo.head, command: "echo ok", exitCode: 0, summary: "worker did it",
+  })
+  const message = await call(tools, "foreman_verify", {
+    step: 1, verdict: "good",
+    commands: [{ command: "echo ok", exitCode: 0 }],
+    transcript: "user saw it",
+    blockingFindings: [{ acceptance: 1, evidence: "still broken" }],
+  })
+  assert.match(message, /^REFUSED: good cannot carry blocking findings\./)
+  assert.equal(readStep(repo, 1).status, "implemented")
+})
+
+await scenario("receipts: unchanged inputs reuse a passing check instead of re-running it", async () => {
+  const repo = makeRepo({ extraFiles: { "count.txt": "1\n" } })
+  const command = "false"
+  const content = fs.readFileSync(path.join(repo.dir, "count.txt"))
+  const digest = createHash("sha256").update(content).digest("hex")
+  const inputsHash = createHash("sha256").update(`count.txt:${content.length}:${digest}`).digest("hex")
+  const key = createHash("sha256").update(`${command}\u0000${inputsHash}`).digest("hex")
+  const step = legacyStep({
+    acceptanceCommands: [command],
+    acceptanceChecks: [{ command, inputs: ["count.txt"] }],
+    acceptanceReceipts: {
+      [key]: { command, inputs: ["count.txt"], inputsHash, exitCode: 0, at: new Date().toISOString(), commit: repo.head },
+    },
+  })
+  writeState(repo, { steps: [step], cursor: 1, current: 1 })
+  const tools = await loadTools(repo.dir)
+  const message = await call(tools, "foreman_verify", {
+    step: 1, verdict: "good",
+    commands: [{ command: "echo verified", exitCode: 0 }],
+    transcript: "user saw the receipt reused",
+  })
+  assert.match(message, /^VERIFIED step 1\./)
+  const verify = readStep(repo, 1, "verify.json")
+  assert.equal(verify.acceptanceRuns[0].reused, true, "the false command must not run when its receipt is valid")
+  assert.equal(verify.acceptanceRuns[0].exitCode, 0)
+  assert.equal(verify.acceptanceRuns[0].durationMs, 0)
+})
+
+await scenario("environment: a missing tool blocks the loop without a fix attempt", async () => {
+  const repo = makeRepo()
+  writeState(repo, { steps: [legacyStep({ acceptanceCommands: ["echo ok"] })], cursor: 1, current: 1 })
+  const tools = await loadTools(repo.dir)
+  const message = await call(tools, "foreman_verify", {
+    step: 1, verdict: "no-good",
+    commands: [{ command: "which definitely-not-installed", exitCode: 127, outputTail: "not found" }],
+    transcript: "the interpreter is missing",
+    failureClass: "environment",
+  })
+  assert.match(message, /^BLOCKED step 1: environment failure\./)
+  const state = readState(repo)
+  assert.match(state.blocked, /environment failure/)
+  const step = readStep(repo, 1)
+  assert.equal(step.status, "implemented")
+  assert.equal((step.fixIssues ?? []).length, 0)
+  assert.ok(fs.readFileSync(ghLog, "utf8").includes("foreman:setup"))
+})
+
+await scenario("artifacts: a unit starts when the upstream worker lands files, before its verdict", async () => {
+  const repo = makeRepo()
+  writeState(repo, { maxParallel: 2, steps: [], units: [], cursor: 0 })
+  const tools = await loadTools(repo.dir)
+  const graph = await call(tools, "foreman_graph", {
+    units: [
+      { id: "a", title: "produce artifacts", dependsOn: [], artifactDependsOn: [], scope: ["a"], seam: [], class: "independent" },
+      { id: "b", title: "consume artifacts", dependsOn: [], artifactDependsOn: ["a"], scope: ["b"], seam: [], class: "independent" },
+    ],
+  })
+  assert.match(graph, /^GRAPH recorded: 2 unit\(s\)/)
+  const created = await call(tools, "foreman_step", {
+    title: "a", goal: "land the files", unitId: "a",
+    acceptance: ["a exists"], acceptanceCommands: ["echo a"], scope: ["a"],
+  })
+  assert.match(created, /^STEP 1 created/)
+  const tooEarly = await call(tools, "foreman_step", {
+    title: "b", goal: "use the files", unitId: "b",
+    acceptance: ["b exists"], acceptanceCommands: ["echo b"], scope: ["b"],
+  })
+  assert.match(tooEarly, /^REFUSED: unit b waits for artifacts of a:/)
+  const recorded = await call(tools, "foreman_result", {
+    step: 1, commit: repo.head, command: "echo a", exitCode: 0, summary: "files landed",
+  })
+  assert.match(recorded, /^RESULT recorded/)
+  const accepted = await call(tools, "foreman_step", {
+    title: "b", goal: "use the files", unitId: "b",
+    acceptance: ["b exists"], acceptanceCommands: ["echo b"], scope: ["b"],
+  })
+  assert.match(accepted, /^STEP 2 created/)
 })
 
 /* -------------------------------- report -------------------------------- */
