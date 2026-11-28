@@ -507,6 +507,91 @@ await scenario("scale: foreman_start persists maxCreatePerTick per loop, on star
   assert.equal(readJson(stateFile).maxCreatePerTick, 9)
 })
 
+await scenario("scale: a step whose dispatch keeps dying backs off instead of re-offering every tick", async () => {
+  const repo = makeRepo()
+  const unit = unitDef("u1")
+  writeState(repo, {
+    maxParallel: 1,
+    units: [unit],
+    steps: [stateStep({ unitId: "u1", status: "open" })],
+    cursor: 1,
+    active: [1],
+  })
+  // A child session that never exists: every sweep sees the dispatch as gone.
+  const tools = await loadTools(repo.dir, { session: { get: async () => undefined } })
+  const realNow = Date.now
+  let offset = 0
+  const advance = (ms) => { offset += ms }
+  Date.now = () => realNow() + offset
+  try {
+    const first = await call(tools, "foreman_next")
+    assert.match(first, /dispatch_worker|multi/, first)
+    const afterOne = readLedger(repo).filter((entry) => entry.type === "dispatch")
+    assert.equal(afterOne.length, 1)
+    assert.equal(afterOne[0].attempt, 1)
+
+    // Simulate the recorded child vanishing: the sweep retires it as "gone".
+    const state = readState(repo)
+    const step = state.steps.find((item) => item.n === 1)
+    step.dispatchSessionID = "ses_dead"
+    delete step.dispatchedAt
+    fs.writeFileSync(path.join(repo.dir, ".foreman", "state.json"), `${JSON.stringify(state, null, 2)}\n`)
+
+    // Within the backoff window the tick does not re-offer: the stall costs one
+    // tick of wait, not one model turn.
+    const held = await call(tools, "foreman_next")
+    assert.match(held, /^ACTION: wait/, held)
+    assert.equal(readLedger(repo).filter((entry) => entry.type === "dispatch").length, 1, "the dead dispatch was re-offered inside the backoff window")
+
+    // After the first backoff the step is offered again, with attempt 2.
+    advance(31_000)
+    const second = await call(tools, "foreman_next")
+    assert.match(second, /dispatch_worker|multi/, second)
+    const afterTwo = readLedger(repo).filter((entry) => entry.type === "dispatch")
+    assert.equal(afterTwo.length, 2)
+    assert.equal(afterTwo[1].attempt, 2)
+
+    // The second attempt doubles the window: ticks inside it stay parked.
+    const parked = await call(tools, "foreman_next")
+    assert.match(parked, /^ACTION: wait/, parked)
+    advance(59_000)
+    assert.match(await call(tools, "foreman_next"), /^ACTION: wait/, "attempt 3 fired before its doubled window elapsed")
+    advance(2_000)
+    const third = await call(tools, "foreman_next")
+    assert.match(third, /dispatch_worker|multi/, third)
+    assert.equal(readLedger(repo).filter((entry) => entry.type === "dispatch").pop().attempt, 3)
+  } finally {
+    Date.now = realNow
+  }
+})
+
+await scenario("scale: a step offered many times without a result blocks instead of retrying forever", async () => {
+  const repo = makeRepo()
+  const unit = unitDef("u1")
+  writeState(repo, {
+    maxParallel: 1,
+    units: [unit],
+    steps: [stateStep({ unitId: "u1", status: "open", dispatchAttempts: 4 })],
+    cursor: 1,
+    active: [1],
+  })
+  const tools = await loadTools(repo.dir, { session: { get: async () => undefined } })
+
+  const blocked = await call(tools, "foreman_next")
+  assert.match(blocked, /^ACTION: blocked — step 1 was offered 4 times/, blocked)
+  assert.match(readState(repo).blocked, /step 1 was offered 4 times/)
+  assert.equal(readLedger(repo).filter((entry) => entry.type === "dispatch").length, 0, "a stalled step was dispatched again")
+
+  // The operator inspected it and unblocked: the next offer is immediate.
+  const state = readState(repo)
+  state.blocked = null
+  state.steps[0].dispatchAttempts = 1
+  fs.writeFileSync(path.join(repo.dir, ".foreman", "state.json"), `${JSON.stringify(state, null, 2)}\n`)
+  const resumed = await call(tools, "foreman_next")
+  assert.match(resumed, /dispatch_worker|multi/, resumed)
+  assert.equal(readLedger(repo).filter((entry) => entry.type === "dispatch").length, 1)
+})
+
 /* -------------------------------- report -------------------------------- */
 
 console.log("")

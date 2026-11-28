@@ -1084,7 +1084,13 @@ await scenario(15, "B1: legacy current migrates to active[] and verified steps l
   ]
   for (const [label, mutate] of shapes) {
     seedLoop(repo, (state) => {
-      for (const step of state.steps) delete step.dispatchedAt
+      // Emulate an old writer clearing the dispatch: no in-flight lease and no
+      // stall backoff, so every shape is independently offerable.
+      for (const step of state.steps) {
+        delete step.dispatchedAt
+        delete step.nextOfferAt
+        delete step.dispatchAttempts
+      }
       mutate(state)
     })
     const next = await call(tools, "foreman_next")

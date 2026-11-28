@@ -238,6 +238,39 @@ The safety boundary is the gate, not a human: a worker never edits the running
 plugin, a product loop only reflects and plans, and the install only happens
 after the code is committed, pushed and verified by the harness suite.
 
+### Dispatch waste — the largest token sink
+
+A loop can spend its whole budget re-dispatching one step. The live
+`LOOPRES_PLAN` ledger recorded **147 `dispatch_worker` offers for step 7 in 21
+minutes, with zero results**: each vanished child cleared the dispatch, the freed
+slot was offered again on the next tick, and every offer paid for another model
+turn. `foreman_rsi` now reports `dispatches` and the re-offers that produced no
+result, and the loop defends itself:
+
+- **Stall backoff.** A step whose dispatch ends without a result is parked and
+  re-offered on a `2^n` schedule (`FOREMAN_DISPATCH_BACKOFF_MS`, default 30s,
+  capped at the lease) instead of every tick. A result or a verdict resets the
+  counter, so only a genuine stall is slowed down.
+- **Fruitless cap.** After `FOREMAN_DISPATCH_MAX_FRUITLESS` (default 4)
+  back-to-back offers with no result the step is a dead dispatch, not a busy
+  worker, and the loop blocks asking for a human instead of paying for another
+  turn. An operator inspects the worktree, records `foreman_dispatch_failed` if
+  there is nothing to salvage, and unblocks with `foreman_steer`.
+
+`scripts/foreman/tests/optimize-eval.mjs` is the measured proof. It drives one
+fixed task — a step whose worker always vanishes — through the harness for a
+21-minute horizon and reports tokens and time per task across cycles:
+
+| cycle | dispatch turns | tokens/task |
+| --- | ---: | ---: |
+| baseline (no backoff) | 158 | 2,722,181 |
+| stall backoff | 5 | 171,950 |
+| backoff + fruitless cap | 4 | 79,709 |
+
+The turn count falls from linear (`O(ticks)`) to logarithmic (`O(log n)`); the
+cycle that only adds the cap blocks instead of continuing. `npm run
+foreman:optimize` reruns it and fails on a sterile cycle.
+
 ## Attempts and rework
 
 One worktree per **step**, not per issue, and the plugin owns it: `foreman_worktree`

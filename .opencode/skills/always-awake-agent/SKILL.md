@@ -108,6 +108,10 @@ own test plan, so it cannot be steered by the implementation.
 One tick = one turn. Every tick ends with a state transition, never with a
 question unless the loop is blocked.
 
+Read this skill **once per session**, not once per tick. It stays in context;
+re-loading 30 KB every tick is the single largest avoidable token cost in the
+loop. Re-open one section only when the returned action is genuinely unclear.
+
 1. `foreman_status` — read STOP, budget, capacity (`n/max` workers and
    `n/max` verify), parallelism (peak concurrent workers), cursor, steps and,
    when a graph exists, every unit with its readiness. Diagnostics only: the

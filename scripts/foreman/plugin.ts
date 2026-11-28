@@ -190,6 +190,33 @@ const WAIT_MS = 5 * 60_000
 // tracked by its session id and this lease is only the fallback for a dispatch
 // whose id was never recorded: a lost dispatch must cost minutes, not hours.
 const DISPATCH_LEASE_MS = 20 * 60_000
+// A dispatch that produces no result must not be re-offered every tick: the
+// step backs off exponentially after each fruitless offer, capped at the lease
+// so a healthy step is never parked longer than the lease fallback. A result
+// resets the counter (clearDispatch), so the cost of one stall is logarithmic in
+// the ticks it survives, not linear.
+const DISPATCH_BACKOFF_BASE_MS = (() => {
+  const raw = process.env.FOREMAN_DISPATCH_BACKOFF_MS
+  if (raw === undefined) return 30_000
+  const value = Number(raw)
+  return Number.isFinite(value) && value >= 0 ? value : 30_000
+})()
+const DISPATCH_BACKOFF_MAX_MS = DISPATCH_LEASE_MS
+const dispatchBackoffMs = (attempts) => DISPATCH_BACKOFF_BASE_MS <= 0
+  ? 0
+  : Math.min(DISPATCH_BACKOFF_MAX_MS, DISPATCH_BACKOFF_BASE_MS * 2 ** Math.max(0, Number(attempts) - 1))
+// After this many back-to-back offers with no result the step is a stalled
+// dispatch, not a busy worker: the loop blocks and asks a human to inspect
+// instead of paying for another turn. The live incident showed 147 offers in
+// 21 minutes for one step; this caps the burn and surfaces the infra failure.
+const dispatchFruitlessCap = (() => {
+  const value = Number(process.env.FOREMAN_DISPATCH_MAX_FRUITLESS)
+  return Number.isFinite(value) && value > 0 ? value : 4
+})()
+const nextOfferAtMs = (step) => {
+  const at = Date.parse(String(step?.nextOfferAt ?? ""))
+  return Number.isFinite(at) ? at : 0
+}
 // Safety bound for a recorded child that never reports an end event. The
 // liveness sweep (finishDispatch on a vanished session) is the fast path, so
 // this stays generous: re-dispatching a slow but healthy worker duplicates work.
@@ -1813,6 +1840,17 @@ function rsiLoopMetrics(dir, id) {
     const at = Date.parse(String(step?.verifiedAt ?? ""))
     if (Number.isFinite(applied) && Number.isFinite(at) && at >= applied) verifyDurations.push(at - applied)
   }
+  // Dispatch waste: an offer whose attempt counter is above 1 means the
+  // previous offer for that step produced no result. Those are the model turns
+  // that bought nothing and are the first thing to drive down.
+  let redispatches = 0
+  let maxAttempts = 0
+  for (const entry of ledger) {
+    if (entry?.type !== "dispatch") continue
+    const attempt = Number(entry?.attempt ?? 1)
+    if (attempt > 1) redispatches += 1
+    if (attempt > maxAttempts) maxAttempts = attempt
+  }
   const rejected = ledger.filter((entry) => entry?.type === "rejected")
   const repeats = rejected.filter((entry) => Number(entry?.repeat) > 0).length
   const signatures = new Map()
@@ -1839,6 +1877,9 @@ function rsiLoopMetrics(dir, id) {
     medianVerifyMs: median(verifyDurations),
     rejected: rejected.length,
     repeats,
+    dispatches: ledger.filter((entry) => entry?.type === "dispatch").length,
+    redispatches,
+    maxAttempts,
     followUps,
     topSignatures: [...signatures.entries()].sort((left, right) => right[1] - left[1]).slice(0, 3)
       .map(([signature, count]) => ({ signature: signature.slice(0, 12), count })),
@@ -1867,6 +1908,9 @@ function rsiMetrics(root, ids = []) {
     acceptanceMs: sum("acceptanceMs"),
     rejected: sum("rejected"),
     repeats: sum("repeats"),
+    dispatches: sum("dispatches"),
+    redispatches: sum("redispatches"),
+    maxAttempts: loops.reduce((max, loop) => Math.max(max, Number(loop.maxAttempts) || 0), 0),
     followUps: sum("followUps"),
   }
   totals.firstPassRate = totals.verified ? totals.firstPass / totals.verified : null
@@ -1905,6 +1949,14 @@ function rsiFindings(metrics) {
       detail: `${totals.repeats} repeat refusal(s). The fix issue must land a committed falsification test; the next verdict should run that suite instead of a fresh prose audit.`,
     })
   }
+  if (totals.dispatches > 0 && totals.redispatches / Math.max(1, totals.dispatches) > 0.2) {
+    findings.push({
+      key: "redispatches",
+      severity: "high",
+      title: "Dispatches are being repeated without a result",
+      detail: `${totals.redispatches} of ${totals.dispatches} dispatch(es) were re-offers of a step whose previous worker produced no result (worst: attempt ${totals.maxAttempts}). Each is a model turn that bought nothing. The stall backoff parks such a step instead of re-offering it every tick.`,
+    })
+  }
   if (totals.fixMs > 30 * 60_000) {
     findings.push({
       key: "fix-cost",
@@ -1931,7 +1983,7 @@ function rsiReport(metrics, findings) {
   const totals = metrics.totals
   const percent = (value) => value === null || value === undefined ? "n/a" : `${(value * 100).toFixed(1)}%`
   const minutes = (value) => `${((Number(value) || 0) / 60_000).toFixed(1)} min`
-  const rows = metrics.loops.map((loop) => `| ${loop.id} | ${loop.steps} | ${loop.verified} | ${percent(loop.firstPassRate)} | ${loop.fixAttempts} | ${minutes(loop.fixMs)} | ${loop.acceptanceRuns} | ${percent(loop.reuseRate)} | ${loop.repeats} | ${loop.followUps} |`)
+  const rows = metrics.loops.map((loop) => `| ${loop.id} | ${loop.steps} | ${loop.verified} | ${percent(loop.firstPassRate)} | ${loop.fixAttempts} | ${minutes(loop.fixMs)} | ${loop.acceptanceRuns} | ${percent(loop.reuseRate)} | ${loop.repeats} | ${loop.dispatches} | ${loop.redispatches} | ${loop.followUps} |`)
   return `# Foreman RSI — ${metrics.generatedAt}
 
 Reflection over the loop's own ledger. This report is evidence for the next
@@ -1952,13 +2004,15 @@ harness plan; it never edits the running plugin.
 | acceptance time | ${minutes(totals.acceptanceMs)} |
 | rejected verdicts | ${totals.rejected} |
 | repeat refusals | ${totals.repeats} |
+| dispatches | ${totals.dispatches} |
+| re-offers without a result | ${totals.redispatches} (worst attempt ${totals.maxAttempts}) |
 | follow-ups filed | ${totals.followUps} |
 
 ## Loops
 
-| loop | steps | verified | first pass | fixes | fix time | runs | reused | repeats | follow-ups |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-${rows.join("\n") || "| (none) | 0 | 0 | n/a | 0 | 0.0 min | 0 | n/a | 0 | 0 |"}
+| loop | steps | verified | first pass | fixes | fix time | runs | reused | repeats | dispatches | re-offers | follow-ups |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+${rows.join("\n") || "| (none) | 0 | 0 | n/a | 0 | 0.0 min | 0 | n/a | 0 | 0 | 0 | 0 |"}
 
 ## Findings
 
@@ -2722,6 +2776,9 @@ export default Plugin.define({
       delete step.dispatchKind
       delete step.dispatchOutcome
       delete step.dispatchErrorAt
+      // Progress resets the stall backoff: the next offer is immediate.
+      delete step.dispatchAttempts
+      delete step.nextOfferAt
     }
     // Event/tool hooks can race a write tool for the loop lock. Retry briefly
     // instead of dropping a live dispatch end; the lease is only the fallback.
@@ -4108,6 +4165,21 @@ export default Plugin.define({
           const unknown = active.find((step) => !ACTIVE_STATUSES.includes(step.status) && step.status !== "verified")
           if (unknown) return ok(`ACTION: blocked — step ${unknown.n} is ${unknown.status}. Inspect foreman_status and the issue.`)
 
+          // A step offered over and over without a result is a dead dispatch, not
+          // a worker in flight. Backoff slows it; this stops it. The cap is
+          // checked only when no child is alive, so a genuinely running worker
+          // is never mistaken for a stall.
+          const stalled = active.find((step) =>
+            ACTIVE_STATUSES.includes(step.status)
+            && !step.result
+            && Number(step.dispatchAttempts ?? 0) >= dispatchFruitlessCap
+            && !inFlight(step, now))
+          if (stalled) {
+            state.blocked = `step ${stalled.n} was offered ${stalled.dispatchAttempts} times and never produced a result. Inspect its worktree (git log/status) and the worker session; record foreman_dispatch_failed if there is nothing to salvage, then unblock with foreman_steer (unblock: true).`
+            store.saveState(state)
+            return ok(`ACTION: blocked — ${state.blocked}`)
+          }
+
           // Phase C2: the ready set. A unit is offered only when it is not
           // taken, every dependency unit has a verified step, its scope is
           // disjoint from the active steps and, for seam-parallel, its seam is a
@@ -4227,6 +4299,9 @@ export default Plugin.define({
           const held = []
           for (const step of active) {
             if (step.status === "verified" || inFlight(step, now)) continue
+            // A step re-dispatched without progress backs off instead of being
+            // re-offered every tick; clearDispatch resets the counter.
+            if (nextOfferAtMs(step) > now) continue
             const unit = step.unitId ? unitById(state, step.unitId) : undefined
             // Phase C3: the fan-in step exists before the parallel workers so
             // its acceptance is already written, but it is dispatched only once
@@ -4304,9 +4379,16 @@ export default Plugin.define({
             delete state.nextWakeAt
             for (const action of actions) {
               action.step.dispatchedAt = nowIso()
+              // Consecutive offers without a result back off exponentially. The
+              // count lives on the step and is cleared the moment a result or a
+              // verdict lands, so only a genuine stall is slowed down.
+              const attempts = Number(action.step.dispatchAttempts ?? 0) + 1
+              action.step.dispatchAttempts = attempts
+              const backoff = dispatchBackoffMs(attempts)
+              if (backoff > 0) action.step.nextOfferAt = new Date(now + backoff).toISOString()
               store.writeStep(action.step.n, "step.json", action.step)
               // Phase C7: the dispatch is the start of a real worker window.
-              store.appendLedger({ type: "dispatch", step: action.step.n, action: action.kind, issue: action.issue })
+              store.appendLedger({ type: "dispatch", step: action.step.n, action: action.kind, issue: action.issue, attempt: attempts })
             }
             // Phase C8: every offered unit is created in this same tick, after
             // the dispatches and only while the worker budget has room.
