@@ -122,6 +122,9 @@ file.
 | `authPasswordEnv` | `FOREMAN_AUTH_PASSWORD_ENV` | _(none)_ | Env var carrying the password command for the heal |
 | `webPort` | `FOREMAN_WEB_PORT` | _(none)_ | Optional web port shown in status/instructions |
 | `apiPort` | `FOREMAN_API_PORT` | _(none)_ | Optional API port shown in status/instructions |
+| `rsiInstall` | `FOREMAN_RSI_INSTALL` | `[]` | Roots that receive a synced harness when RSI ships a new version |
+| `rsiReloadCommand` | `FOREMAN_RSI_RELOAD_COMMAND` | _(none)_ | Command that reloads the harness on the new version |
+| `rsiSource` | `FOREMAN_RSI_SOURCE` | _(loop root)_ | Harness repo `foreman_rsi_ship` syncs from |
 
 Example `.foreman/foreman.config.json`:
 
