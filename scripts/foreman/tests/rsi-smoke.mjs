@@ -40,7 +40,7 @@ function writeJson(file, value) {
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`)
 }
 
-async function loadTools(root) {
+async function loadTools(root, instance = plugin) {
   const tools = {}
   const ctx = {
     location: { directory: root },
@@ -49,7 +49,7 @@ async function loadTools(root) {
     permission: { list: async () => [] },
     event: { subscribe: async function* () {} },
   }
-  await plugin.setup(ctx)
+  await instance.setup(ctx)
   return tools
 }
 
@@ -248,6 +248,38 @@ await scenario("RSI ship: refuses without git provenance, then installs a pushed
   // Idempotent: a second ship changes nothing.
   const again = await call(tools, "foreman_rsi_ship", { source: repo, targets: [target], reload: false })
   assert.match(again, /0 changed \/ 2 file\(s\)/)
+})
+
+await scenario("RSI: the plan lands in the harness repo when FOREMAN_RSI_SOURCE is set", async () => {
+  const product = path.join(tmp, "product-loop")
+  const harnessRepo = path.join(tmp, "product-harness")
+  fs.mkdirSync(path.join(product, "plans"), { recursive: true })
+  fs.mkdirSync(path.join(harnessRepo, "scripts/foreman"), { recursive: true })
+  fs.writeFileSync(path.join(harnessRepo, "scripts/foreman/plugin.ts"), "// harness\n")
+  makeLoop(product, "L1", {
+    units: [{ id: "U1", title: "one", class: "serial", dependsOn: [], artifactDependsOn: [], scope: ["u1"], seam: [] }],
+    steps: [verifiedStep(1, { fixes: [7, 8], runs: [{ command: "true", exitCode: 0, durationMs: 10, reused: false }] })],
+    ledger: [{ at: "2026-11-27T10:08:00.000Z", type: "rejected", step: 2, issue: 7, signature: "abc", repeat: 0, kind: "evidence" }],
+  })
+  process.env.FOREMAN_RSI_SOURCE = harnessRepo
+  const sourced = path.join(tmp, "plugin-sourced.mjs")
+  await build({
+    entryPoints: [path.join(repoRoot, "scripts/foreman/plugin.ts")],
+    bundle: true, platform: "node", format: "esm", outfile: sourced,
+    alias: { "@opencode/plugin": path.join(here, "plugin-stub.ts") }, logLevel: "silent",
+  })
+  try {
+    const instance = (await import(pathToFileURL(sourced).href)).default
+    const tools = await loadTools(product, instance)
+    const message = await call(tools, "foreman_rsi", { loops: ["L1"], writePlan: true })
+    assert.match(message, /harness repo:/)
+    assert.ok(fs.existsSync(path.join(harnessRepo, "plans/HARNESS_RSI.md")))
+    assert.equal(fs.existsSync(path.join(product, "plans/HARNESS_RSI.md")), false)
+    const plan = fs.readFileSync(path.join(harnessRepo, "plans/HARNESS_RSI.md"), "utf8")
+    assert.match(plan, /Harness repo \(where this plan runs\)/)
+  } finally {
+    delete process.env.FOREMAN_RSI_SOURCE
+  }
 })
 
 console.log("")
