@@ -1840,15 +1840,28 @@ function rsiLoopMetrics(dir, id) {
     const at = Date.parse(String(step?.verifiedAt ?? ""))
     if (Number.isFinite(applied) && Number.isFinite(at) && at >= applied) verifyDurations.push(at - applied)
   }
-  // Dispatch waste: an offer whose attempt counter is above 1 means the
-  // previous offer for that step produced no result. Those are the model turns
-  // that bought nothing and are the first thing to drive down.
+  // Dispatch waste: a worker offered, retired without a result, then offered
+  // again. The live LOOPRES_PLAN loop did this 147 times for one step. The
+  // `attempt` counter on new dispatches is exact; the historical inference
+  // (worker dispatches minus recorded results) catches ledgers written before
+  // the counter existed.
+  const workerDispatches = new Map()
+  const workerResults = new Map()
+  for (const entry of ledger) {
+    if (entry?.type === "dispatch" && entry?.action === "dispatch_worker") {
+      workerDispatches.set(entry.step, (workerDispatches.get(entry.step) ?? 0) + 1)
+    } else if (entry?.type === "result") {
+      workerResults.set(entry.step, (workerResults.get(entry.step) ?? 0) + 1)
+    }
+  }
   let redispatches = 0
   let maxAttempts = 0
+  for (const [step, count] of workerDispatches) {
+    redispatches += Math.max(0, count - Math.max(1, workerResults.get(step) ?? 0))
+  }
   for (const entry of ledger) {
     if (entry?.type !== "dispatch") continue
     const attempt = Number(entry?.attempt ?? 1)
-    if (attempt > 1) redispatches += 1
     if (attempt > maxAttempts) maxAttempts = attempt
   }
   const rejected = ledger.filter((entry) => entry?.type === "rejected")
@@ -1954,7 +1967,7 @@ function rsiFindings(metrics) {
       key: "redispatches",
       severity: "high",
       title: "Dispatches are being repeated without a result",
-      detail: `${totals.redispatches} of ${totals.dispatches} dispatch(es) were re-offers of a step whose previous worker produced no result (worst: attempt ${totals.maxAttempts}). Each is a model turn that bought nothing. The stall backoff parks such a step instead of re-offering it every tick.`,
+      detail: `${totals.redispatches} of ${totals.dispatches} dispatch(es) were re-offers of a step whose previous worker produced no result${totals.maxAttempts > 1 ? ` (worst: attempt ${totals.maxAttempts})` : " (inferred from worker dispatches without a result)"}. Each is a model turn that bought nothing. The stall backoff parks such a step instead of re-offering it every tick.`,
     })
   }
   if (totals.fixMs > 30 * 60_000) {
