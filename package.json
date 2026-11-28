@@ -18,7 +18,7 @@
     "typecheck": "tsc --noEmit",
     "foreman:drill": "node scripts/foreman/drill.mjs",
     "foreman:concurrency": "node scripts/foreman/concurrency-probe.mjs",
-    "foreman:test": "node scripts/foreman/tests/guards-smoke.mjs && node scripts/foreman/tests/acceptance-smoke.mjs && node scripts/foreman/tests/multi-loop-smoke.mjs && node scripts/foreman/tests/human-steer-smoke.mjs && node scripts/foreman/tests/parallel-scale.mjs && node scripts/foreman/tests/repo-pointer-smoke.mjs && node scripts/foreman/tests/rsi-smoke.mjs && node scripts/foreman/tests/optimize-eval.mjs",
+    "foreman:test": "node scripts/foreman/tests/guards-smoke.mjs && node scripts/foreman/tests/acceptance-smoke.mjs && node scripts/foreman/tests/multi-loop-smoke.mjs && node scripts/foreman/tests/human-steer-smoke.mjs && node scripts/foreman/tests/parallel-scale.mjs && node scripts/foreman/tests/repo-pointer-smoke.mjs && node scripts/foreman/tests/rsi-smoke.mjs && node scripts/foreman/tests/coach-smoke.mjs && node scripts/foreman/tests/optimize-eval.mjs",
     "foreman:optimize": "node scripts/foreman/tests/optimize-eval.mjs",
     "foreman:real": "node scripts/foreman/tests/real-stack.mjs",
     "test": "npm run typecheck && npm run foreman:test"

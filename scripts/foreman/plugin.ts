@@ -143,6 +143,12 @@ const CONFIG = {
   rsiReloadCommand: String(process.env.FOREMAN_RSI_RELOAD_COMMAND ?? "").trim(),
   /** Harness repo to sync from. Empty = the loop's own root. */
   rsiSource: String(process.env.FOREMAN_RSI_SOURCE ?? "").trim(),
+  /** Mid-loop coach: reflect between steps and self-upgrade a distinct harness repo. */
+  midLoopRsi: String(process.env.FOREMAN_RSI_MIDLOOP ?? "on").trim().toLowerCase() !== "off",
+  /** Minimum verified steps between two mid-loop upgrades. */
+  midLoopEvery: Math.max(1, Number(process.env.FOREMAN_RSI_MIDLOOP_EVERY ?? 3) || 3),
+  /** Minimum wall-clock gap between two mid-loop upgrades. */
+  midLoopMinMs: Math.max(0, Number(process.env.FOREMAN_RSI_MIDLOOP_MIN_MS ?? 600_000) || 0),
 }
 const ENV_SET = (key) => process.env[key] !== undefined
 const ENV_KEY = {
@@ -160,6 +166,9 @@ const ENV_KEY = {
   rsiInstall: "FOREMAN_RSI_INSTALL",
   rsiReloadCommand: "FOREMAN_RSI_RELOAD_COMMAND",
   rsiSource: "FOREMAN_RSI_SOURCE",
+  midLoopRsi: "FOREMAN_RSI_MIDLOOP",
+  midLoopEvery: "FOREMAN_RSI_MIDLOOP_EVERY",
+  midLoopMinMs: "FOREMAN_RSI_MIDLOOP_MIN_MS",
 }
 /** CONFIG keys whose value is a list rather than a scalar string. */
 const LIST_KEYS = new Set(["barrels", "rsiInstall"])
@@ -1795,8 +1804,10 @@ function stepSummary(step) {
 // Recursive self-improvement, the foreman-sized version: read the loop's own
 // ledger, measure where it spent effort, and turn the findings into a harness
 // plan that the same foreman loop can execute. The reflection is read-only
-// except for the report and the generated plan; installing the improved plugin
-// stays a human-gated step.
+// except for the report and the generated plan. Installing the improved plugin
+// is gated by the harness suite + a push, never by a human: at plan complete
+// foreman_rsi_ship ships it, and mid-plan the coach fires ACTION: coach upgrade
+// on a proven defect at an idle boundary.
 const RSI_REPORT = ".foreman/rsi/report.md"
 const RSI_METRICS = ".foreman/rsi/metrics.json"
 const RSI_PLAN = "plans/HARNESS_RSI.md"
@@ -2084,6 +2095,72 @@ ${metrics.totals.fixAttempts} fix attempt(s), ${((metrics.totals.fixMs || 0) / 6
 ${(metrics.totals.reuseRate === null ? "n/a" : `${(metrics.totals.reuseRate * 100).toFixed(1)}%`)} receipt reuse.
 
 ${sections}`
+}
+
+// ---- Mid-loop coach --------------------------------------------------------
+// Between one step and the next the harness reads back the builder/verifier
+// exchange and coaches the next pair: the guidance it injects into the next
+// brief, and — when the ledger proves a harness defect and a distinct harness
+// repo is configured — a bounded self-upgrade. The upgrade runs inline in this
+// session (a harness worker fixes one finding, the suite gates it, the fix is
+// pushed, foreman_rsi_ship installs and reloads) and the product loop resumes
+// from the same cursor. The card itself never edits the running plugin.
+
+function latestVerdict(ledger) {
+  let last = null
+  for (const entry of ledger) {
+    if (entry?.type === "verified") last = { verdict: "verified", step: Number(entry.step) }
+    else if (entry?.type === "rejected") last = { verdict: "rejected", step: Number(entry.step), signature: String(entry.signature ?? ""), repeat: Number(entry.repeat ?? 0) }
+  }
+  return last
+}
+
+function stepDispatchStats(ledger, n) {
+  let workers = 0; let results = 0; let rejects = 0; let maxRepeat = 0
+  for (const entry of ledger) {
+    if (Number(entry?.step) !== Number(n)) continue
+    if (entry?.type === "dispatch" && entry?.action === "dispatch_worker") workers += 1
+    else if (entry?.type === "result") results += 1
+    else if (entry?.type === "rejected") { rejects += 1; maxRepeat = Math.max(maxRepeat, Number(entry?.repeat ?? 0)) }
+  }
+  return { workers, results, rejects, maxRepeat, redispatches: Math.max(0, workers - Math.max(1, results)) }
+}
+
+function coachCard(state, ledger, verdict) {
+  const step = (state.steps ?? []).find((item) => Number(item?.n) === Number(verdict.step))
+  const stats = stepDispatchStats(ledger, verdict.step)
+  const fixes = Array.isArray(step?.fixIssues) ? step.fixIssues.length : 0
+  const runs = Array.isArray(step?.verify?.acceptanceRuns) ? step.verify.acceptanceRuns.length : 0
+  const reused = runs ? step.verify.acceptanceRuns.filter((run) => run?.reused).length : 0
+  const guidance = []
+  const findings = []
+  if (verdict.verdict === "rejected") {
+    if (stats.maxRepeat > 0 || Number(verdict.repeat ?? 0) > 0) {
+      guidance.push("repeat failure: the fix issue must land a committed falsification test; the verifier runs that suite instead of a fresh prose audit.")
+      findings.push({ key: "repeats", severity: "medium", title: "The same failure signature was refused more than once", detail: `step ${verdict.step} failed again with signature ${verdict.signature.slice(0, 12)}. The harness must escalate to a committed falsification test.` })
+    } else {
+      guidance.push("attach the exact failing command and its output to the fix issue; keep the blocking acceptance falsifiable.")
+    }
+  } else {
+    if (fixes === 0 && stats.redispatches === 0) guidance.push("first pass: the brief and the acceptance were right-sized for this step; keep them.")
+    if (fixes > 0) {
+      guidance.push(`the step needed ${fixes} fix attempt(s): move non-blocking prose into followUps and tighten the blocking acceptance.`)
+      findings.push({ key: "first-pass", severity: "medium", title: "First-pass yield is below 80%", detail: `step ${verdict.step} needed ${fixes} fix attempt(s). The triage and the step brief are the first place to look.` })
+    }
+    if (stats.redispatches > 0) {
+      guidance.push(`the dispatch for step ${verdict.step} died ${stats.redispatches} time(s) before a result: inspect the worktree before relaunching.`)
+      findings.push({ key: "redispatches", severity: "high", title: "Dispatches are being repeated without a result", detail: `step ${verdict.step} was offered ${stats.workers} times with ${stats.results} result(s). The stall backoff parks such a step instead of re-offering it every tick.` })
+    }
+    if (runs > 0 && reused === 0) {
+      findings.push({ key: "receipts", severity: "medium", title: "Acceptance receipts are barely reused", detail: `step ${verdict.step} ran ${runs} acceptance command(s) with no reused receipt. Declare acceptanceChecks inputs precisely.` })
+    }
+  }
+  return { step: Number(verdict.step), verdict: verdict.verdict, fixes, runs, reused, redispatches: stats.redispatches, maxRepeat: stats.maxRepeat, guidance, findings }
+}
+
+function coachLine(state) {
+  const guidance = state?.coach?.guidance
+  return Array.isArray(guidance) && guidance.length ? ` COACH: ${guidance.join(" ")}` : ""
 }
 
 // What an install copies from the harness repo. `scripts/foreman/` is the whole
@@ -3856,7 +3933,7 @@ export default Plugin.define({
 
       editor.add({
         name: "foreman_rsi",
-        description: "Reflect on one or more loops' own ledger and turn the findings into a harness plan (recursive self-improvement, human-gated). Read-only except the report and the generated plan: it computes first-pass yield, fix attempts/time, receipt reuse, repeat refusals and follow-ups, writes .foreman/rsi/report.md + metrics.json, and with writePlan:true writes plans/HARNESS_RSI.md with one unit per finding. It never edits or installs the running plugin; the generated plan is meant to be run by the same foreman loop in the harness repository, then installed and the loop restarted.",
+        description: "Reflect on one or more loops' own ledger and turn the findings into a harness plan (recursive self-improvement). Read-only except the report and the generated plan: it computes first-pass yield, fix attempts/time, receipt reuse, repeat refusals, dispatch re-offers and follow-ups, writes .foreman/rsi/report.md + metrics.json, and with writePlan:true writes plans/HARNESS_RSI.md with one unit per finding. It never edits or installs the running plugin; the generated plan is meant to be run by the same foreman loop in the harness repository, then installed and the loop restarted. This is the plan-complete half: mid-plan, when a distinct harness repo is configured, foreman_next coaches each builder/verifier exchange and returns ACTION: coach upgrade at an idle boundary to fix, push, install and reload one finding before the next step.",
         input: objectSchema({
           loops: { type: "array", items: { type: "string" }, description: "Loop ids to include. Empty = every loop under .foreman/active plus the legacy loop." },
           writePlan: { type: "boolean", description: "Write the generated harness plan (default false: report only)." },
@@ -4193,6 +4270,30 @@ export default Plugin.define({
             return ok(`ACTION: blocked — ${state.blocked}`)
           }
 
+          // Mid-loop coach: read back the last builder/verifier exchange once,
+          // at the step boundary, and persist a card. The guidance rides into the
+          // next brief; a proven harness defect arms a bounded self-upgrade that
+          // fires on the next idle boundary.
+          {
+            const verdict = latestVerdict(store.ledgerEntries())
+            if (verdict) {
+              const coach = coachCard(state, store.ledgerEntries(), verdict)
+              const prior = state.coach
+              if (!prior || Number(prior.step) !== coach.step || prior.verdict !== coach.verdict) {
+                const harness = rsiHarnessRoot(root)
+                const distinct = Boolean(harness) && realPath(harness) !== realPath(root)
+                const sinceStep = coach.step - Number(prior?.upgradeStep ?? 0)
+                const upgradeAt = Date.parse(String(prior?.upgradeAt ?? ""))
+                const sinceMs = Number.isFinite(upgradeAt) ? now - upgradeAt : Infinity
+                const armed = CONFIG.midLoopRsi && distinct && coach.findings.length > 0
+                  && sinceStep >= CONFIG.midLoopEvery && sinceMs >= CONFIG.midLoopMinMs
+                state.coach = { ...coach, at: nowIso(), ...(armed ? { pending: true, harness } : {}) }
+                store.appendLedger({ type: "coach", step: coach.step, verdict: coach.verdict, fixes: coach.fixes, redispatches: coach.redispatches, upgrade: armed })
+                store.saveState(state)
+              }
+            }
+          }
+
           // Phase C2: the ready set. A unit is offered only when it is not
           // taken, every dependency unit has a verified step, its scope is
           // disjoint from the active steps and, for seam-parallel, its seam is a
@@ -4260,7 +4361,7 @@ export default Plugin.define({
               unit.class === "integration"
                 ? `ORDER: the fan-in acceptance is written before the parallel workers start. This step stays a hold until ${unit.dependsOn.join(", ")} are verified; only it may hold a barrel.`
                 : null,
-              "INSTRUCTION: read the plan, call foreman_step with unitId, title, goal, acceptance, acceptanceCommands (the exact plan commands) and scope. Do not invent scope.",
+              "INSTRUCTION: read the plan, call foreman_step with unitId, title, goal, acceptance, acceptanceCommands (the exact plan commands) and scope. Do not invent scope." + coachLine(state),
             ].filter((line) => line !== null)
           }
 
@@ -4288,6 +4389,44 @@ export default Plugin.define({
             ].join("\n"))
           }
 
+          // Mid-loop self-upgrade: a proven harness defect, an idle boundary, a
+          // distinct harness repo and the rate limit all align. Write the harness
+          // plan from this loop's own ledger and return the action before the
+          // next step is created. The upgrade runs inline — a harness worker
+          // fixes one finding, the suite gates it, the fix is pushed, then
+          // foreman_rsi_ship installs and reloads — and the product loop resumes
+          // from the same cursor.
+          if (state.coach?.pending && !active.length) {
+            state.coach.pending = false
+            const harnessRaw = String(state.coach.harness ?? rsiHarnessRoot(root) ?? "")
+            const harness = harnessRaw ? realPath(harnessRaw) : ""
+            const metrics = rsiMetrics(root, [loopNameOf(state)])
+            const findings = rsiFindings(metrics)
+            const actionable = findings.filter((finding) => finding.severity !== "info")
+            if (harness && actionable.length) {
+              const reportPath = path.resolve(root, RSI_REPORT)
+              const planPath = path.join(harness, RSI_PLAN)
+              writeText(reportPath, rsiReport(metrics, findings))
+              writeText(planPath, rsiPlanText({ metrics, findings, reportPath, commands: RSI_COMMANDS, harness }))
+              state.coach.upgradeAt = nowIso()
+              state.coach.upgradeStep = state.coach.step
+              state.coach.upgradePlan = planPath
+              store.saveState(state)
+              store.appendLedger({ type: "coach_upgrade", step: state.coach.step, plan: planPath, harness, findings: actionable.map((finding) => finding.key) })
+              return ok([
+                "ACTION: coach upgrade",
+                capacity,
+                `COACH: step ${state.coach.step} ${state.coach.verdict}${state.coach.fixes ? ` after ${state.coach.fixes} fix(es)` : ""}${state.coach.redispatches ? `, ${state.coach.redispatches} re-offer(s)` : ""}.`,
+                `FINDINGS: ${actionable.map((finding) => `[${finding.severity}] ${finding.title}`).join("; ")}`,
+                `HARNESS: ${harness}`,
+                `PLAN: ${planPath}`,
+                `REPORT: ${reportPath}`,
+                `INSTRUCTION: mid-loop self-upgrade. The pipeline is idle and the ledger proves a harness defect. 1) run a harness worker subagent in ${harness} on the first unit of PLAN, scoped to scripts/foreman + .opencode, with the plan's acceptance commands; 2) when the suite is green, commit on the harness branch and push (git add/commit/push) — foreman_rsi_ship refuses unless HEAD is already on origin; 3) call foreman_rsi_ship (source ${harness}, reload true) to install and reload; 4) resume this loop: the cursor and the active steps are unchanged, call foreman_next to continue. A red suite aborts the upgrade and keeps the current version.`,
+              ].join("\n"))
+            }
+            store.saveState(state)
+          }
+
           const instruction = (action, background) => {
             const previousDispatch = action.step.dispatchEndedAt
               ? ` PREVIOUS_DISPATCH: ${action.step.dispatchSessionID ? `session ${action.step.dispatchSessionID} ` : ""}ended without a recorded result (${action.step.dispatchOutcome ?? "unknown"}); inspect its worktree with git log/status before relaunching, and call foreman_dispatch_failed first if there is nothing to salvage.`
@@ -4297,11 +4436,12 @@ export default Plugin.define({
               : ` WORKTREE: call foreman_worktree with step ${action.step.n} first and put the returned WORKTREE path in the brief.`
             const verifierTree = " WORKTREE: call foreman_worktree with kind \"verifier\" and give the verifier that path; it must not create one of its own."
             const modelNote = CONFIG.model ? ` (model ${CONFIG.model})` : ""
-            return action.kind === "dispatch_verifier"
+            const brief = action.kind === "dispatch_verifier"
             ? `run a fresh general subagent${modelNote} in the foreground with the verifier brief. It must not see the worker transcript or the diff.${verifierTree}${previousDispatch}`
             : action.step.status === "fixing"
               ? `${background ? "launch a fresh worker in the background" : "run a fresh worker in the foreground"} on the open fix issue. Same scope, same acceptance, no weakening.${worktree}${previousDispatch}`
               : `${background ? `launch a fresh general subagent${modelNote} in the background` : `run a fresh general subagent${modelNote} in the foreground`} with the worker brief for issue #${action.issue}.${worktree}${previousDispatch}`
+            return brief + coachLine(state)
           }
 
           // Phase B3/B4: a verifier of N and a worker of N+1 land in the same

@@ -160,6 +160,11 @@ loop. Re-open one section only when the returned action is genuinely unclear.
      plan, then `foreman_publish` (merge the loop branch into the configured
      publish branch, push it, move the running stack onto it), then
      `foreman_stop` with reason `plan complete`.
+   - `coach upgrade` → the pipeline is idle and the ledger proves a harness
+     defect. The plan is already written: run a harness worker on its first unit
+     in the `HARNESS:` repo, let the harness suite gate it, commit and push,
+     `foreman_rsi_ship`, then call `foreman_next` to resume this loop. The
+     cursor and active steps are unchanged. A red suite aborts it.
 4. Record what came back:
    - worker → `foreman_result` (commit, command, exitCode, summary,
      outputTail, plus `durationMs` and `worktree` when the worker reported them)
@@ -533,6 +538,23 @@ This is the only sanctioned self-modification path. A worker never edits the
 running plugin; a product loop only reflects and plans. The install is the
 foreman's, gated on the code being committed, pushed and verified. If you skip
 `foreman_rsi` the loop still publishes, but the next iteration gets no better.
+
+### Mid-loop coach
+
+The batch above fires once, at `plan complete`. When a **distinct** harness repo
+is configured (`FOREMAN_RSI_SOURCE`), the same reflection also runs on every
+step boundary, like a coach reading back the last builder/verifier exchange:
+
+- each verdict writes a coach card; its guidance rides into the next `create_step`
+  and dispatch instruction as a `COACH:` line (repeat failure → a committed
+  falsification test; repeated dispatch death → inspect the worktree; no reused
+  receipt → declare `acceptanceChecks` inputs);
+- when the card proves a harness defect, `foreman_next` returns `ACTION: coach
+  upgrade` at an idle boundary. Treat it exactly like the batch: fix the first
+  unit of the written plan with a harness worker, gate on the suite, commit and
+  push, `foreman_rsi_ship`, then `foreman_next` to resume. It is rate-limited by
+  `FOREMAN_RSI_MIDLOOP_EVERY` steps / `FOREMAN_RSI_MIDLOOP_MIN_MS` and never
+  fires at a non-idle boundary or on a repo that is the loop's own root.
 
 ## Stop, budget, compaction
 

@@ -93,6 +93,10 @@ If it says `wait`, do nothing until `NEXT`; the plugin skips the ticks before
 If it says `plan complete`, every unit has a verified step and nothing is in
 flight: call `foreman_publish` (merge the loop branch into the configured
 publish branch, push it, and move the running stack onto that merge).
+If it says `coach upgrade`, the pipeline is idle and the ledger proved a harness
+defect. The plan is already written: run a harness worker on its first unit in
+the named `HARNESS:` repo, gate on the harness suite, commit and push,
+`foreman_rsi_ship`, then `foreman_next` to resume this loop unchanged.
 
 Then close the RSI cycle:
 - For a **product** loop, call `foreman_rsi` with `writePlan: true` to turn this

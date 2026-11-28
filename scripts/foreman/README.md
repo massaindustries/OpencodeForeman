@@ -271,6 +271,38 @@ The turn count falls from linear (`O(ticks)`) to logarithmic (`O(log n)`); the
 cycle that only adds the cap blocks instead of continuing. `npm run
 foreman:optimize` reruns it and fails on a sterile cycle.
 
+### Mid-loop coach — improve between one step and the next
+
+Plan-complete RSI is a batch. The coach is the same reflection on every step
+boundary, so the harness adapts *while* the plan runs, like a coach reading back
+the last builder/verifier exchange:
+
+- **A coach card** is written when a verdict lands (`state.coach`, ledger type
+  `coach`): first-pass?, fix count, dispatch re-offers, receipt reuse, repeated
+  failure signatures, and the guidance for the next pair of briefs.
+- **The guidance rides into the next brief** (`COACH:` on the next `create_step`
+  and dispatch instruction): a repeat failure tells the fix to land a committed
+  falsification test, a repeated dispatch death says to inspect the worktree, a
+  missing receipt says to declare `acceptanceChecks` inputs.
+- **A proven harness defect self-upgrades at an idle boundary.** When the card
+  finds a harness defect and a *distinct* harness repo is configured
+  (`FOREMAN_RSI_SOURCE`), `foreman_next` returns `ACTION: coach upgrade` once the
+  pipeline is empty: it writes the harness plan from this loop's own ledger, a
+  harness worker fixes one finding (scoped to `scripts/foreman` + `.opencode`),
+  the harness suite gates it, the fix is committed and pushed, then
+  `foreman_rsi_ship` installs and reloads. The product loop resumes from the same
+  cursor — no second loop, because `foreman_rsi_ship` is loop-independent and the
+  harness worker is an ordinary subagent.
+
+Safety rails: the upgrade only fires at an **idle** boundary (no worker or
+verifier in flight), only when a finding is actionable, only against a repo
+distinct from the loop root (a harness loop never re-upgrades itself), a **red
+suite aborts it**, `foreman_rsi_ship` still refuses unless the repo is clean and
+already pushed, and it is rate-limited by `FOREMAN_RSI_MIDLOOP_EVERY` steps and
+`FOREMAN_RSI_MIDLOOP_MIN_MS` (default 3 steps / 10 min). `FOREMAN_RSI_MIDLOOP=off`
+disables it. `scripts/foreman/tests/coach-smoke.mjs` covers the card, the upgrade
+and the resume.
+
 ## Attempts and rework
 
 One worktree per **step**, not per issue, and the plugin owns it: `foreman_worktree`
