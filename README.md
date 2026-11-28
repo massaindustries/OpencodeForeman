@@ -44,6 +44,11 @@ network, no real `gh` — and asserts every guardrail.
 - **Artifact dependencies.** A unit can wait for an upstream worker's files
   (`artifactDependsOn`) without waiting for that unit's verification, so GPU and
   data work start while the report is still being accepted.
+- **Recursive self-improvement.** The loop reflects on its own ledger with
+  `foreman_rsi` (first-pass yield, fix time, receipt reuse, repeat refusals) and
+  writes `plans/HARNESS_RSI.md`; the same loop executes and publishes it, and
+  `foreman_rsi_ship` syncs the verified version onto every `FOREMAN_RSI_INSTALL`
+  root and reloads it — run → watch → plan → fix → ship → reload.
 - **A GitHub ledger.** Steps, plans, fixes and human steering all live as issues,
   pinned to the repository the directory points at.
 - **A human channel.** An open issue labelled `human` **and** `loop:<Loop>` is a
@@ -149,6 +154,8 @@ The plugin exposes the tools the agent drives:
 | `foreman_verify` | verify a step and record evidence |
 | `foreman_dispatch_failed` | retire a dispatch whose child died without a result |
 | `foreman_handoff` | hand a loop to another session |
+| `foreman_rsi` | reflect on the ledger and generate the next harness plan |
+| `foreman_rsi_ship` | install a verified harness version and reload it |
 | `foreman_steer` | acknowledge a human-channel message |
 | `foreman_status` / `foreman_ledger` | inspect the loop and its issue ledger |
 | `foreman_publish` | merge a complete plan into the publish branch |

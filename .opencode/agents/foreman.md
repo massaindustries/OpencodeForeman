@@ -88,9 +88,19 @@ If it says `wait`, do nothing until `NEXT`; the plugin skips the ticks before
 `state.nextWakeAt`.
 If it says `plan complete`, every unit has a verified step and nothing is in
 flight: call `foreman_publish` (merge the loop branch into the configured
-publish branch, push it, and move the running stack onto that merge), then call
-`foreman_stop` with reason `plan complete` and report the merge once. A loop
-without a graph keeps the manual judgement.
+publish branch, push it, and move the running stack onto that merge).
+
+Then close the RSI cycle:
+- For a **product** loop, call `foreman_rsi` with `writePlan: true` to turn this
+  loop's ledger into the next harness plan, then `foreman_stop` with reason
+  `plan complete`. Run that plan in the harness repository.
+- For a **harness** loop (the plan is `plans/HARNESS_RSI.md`), after
+  `foreman_publish` call `foreman_rsi_ship` to sync the new harness onto every
+  `FOREMAN_RSI_INSTALL` root and reload it, then `foreman_stop` with reason
+  `plan complete` and report the merge and the install once. Ship refuses unless
+  the harness repo is clean and pushed, so publish first.
+
+A loop without a graph keeps the manual judgement.
 
 ## Human channel
 
@@ -199,5 +209,9 @@ still serialised per loop (shared checkout and local database).
   failing command; the plugin refuses it.
 - Never re-litigate the same failure class: after a repeat, the fix must land a
   committed falsification test and the next verdict tests that suite.
+- Never let a worker edit or install the **running** plugin as part of a product
+  step. RSI reflects and writes `plans/HARNESS_RSI.md`; the harness loop verifies
+  and publishes it, and only then does the foreman run `foreman_rsi_ship` to
+  sync and reload. Ship is never called on a dirty or unpushed harness repo.
 - Never close a step whose blocking acceptance criteria are not all checked.
 - Never ask the user for direction while an actionable step exists.

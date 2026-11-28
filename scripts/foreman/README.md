@@ -204,6 +204,40 @@ upstream worker's step is `implemented` (the files exist), not until it is
 verified. Use it so GPU/data work starts while a documentary tail is still in
 verification.
 
+## Recursive self-improvement (RSI)
+
+`foreman_rsi` is the harness reflecting on itself, not on the product. It reads
+the ledger and step files of the selected loops and computes:
+
+- **first-pass yield** — verified steps that needed no fix;
+- **fix attempts and time** — rejected verdict to the next result;
+- **receipt reuse** — acceptance runs that reused a passing receipt;
+- **repeat refusals** — the same failure signature refused twice;
+- **follow-ups** — non-blocking findings that were filed as issues.
+
+It writes `.foreman/rsi/report.md` and `metrics.json`, and with
+`writePlan: true` it writes `plans/HARNESS_RSI.md`: one unit per actionable
+finding, scoped to `scripts/foreman/` + `.opencode/`, with the harness suite as
+the acceptance commands. The plan is run by the **same** foreman loop in the
+harness repository; every unit is verified by `typecheck`, `foreman:test` and
+`drill.mjs` before the version ships. The full cycle is:
+
+```
+run -> watch -> plan (foreman_rsi) -> fix (harness loop) -> publish -> ship -> reload
+```
+
+`foreman_rsi_ship` is the install half. It refuses unless the harness repo is
+clean and its HEAD is already on `origin/<branch>` (so `foreman_publish` ran),
+then copies `scripts/foreman/` and `.opencode/{agents,skills,commands,plugins}/`
+onto every root in `FOREMAN_RSI_INSTALL`, writes `.foreman/rsi/install.json`,
+and — when `FOREMAN_RSI_RELOAD_COMMAND` is set — runs it so the harness restarts
+on the new version. `FOREMAN_RSI_SOURCE` picks the harness repo when the loop
+root is not it.
+
+The safety boundary is the gate, not a human: a worker never edits the running
+plugin, a product loop only reflects and plans, and the install only happens
+after the code is committed, pushed and verified by the harness suite.
+
 ## Attempts and rework
 
 One worktree per **step**, not per issue, and the plugin owns it: `foreman_worktree`
